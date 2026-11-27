@@ -90,8 +90,26 @@ impl Named {
         named.name_from_registers(&mut want, pack);
         // What the registers do not keep.
         named.finding = "enumeration";
-        depth_space(|b| named.try_depth(&mut want, &b));
-        raster_space(|b| named.try_raster(&mut want, &b));
+        if !want.depth.is_empty() {
+            let _ = depth_space(|b| {
+                named.try_depth(&mut want, &b);
+                if want.depth.is_empty() {
+                    std::ops::ControlFlow::Break(())
+                } else {
+                    std::ops::ControlFlow::Continue(())
+                }
+            });
+        }
+        if !want.raster.is_empty() {
+            let _ = raster_space(|b| {
+                named.try_raster(&mut want, &b);
+                if want.raster.is_empty() {
+                    std::ops::ControlFlow::Break(())
+                } else {
+                    std::ops::ControlFlow::Continue(())
+                }
+            });
+        }
         named
     }
 
@@ -155,7 +173,7 @@ const SLOPES: [f32; 29] = [
     -1.0, -1.5, -2.0, -4.0, 0.75, 1.25, 6.0, 7.0, 20.0, 32.0, 64.0, 100.0,
 ];
 
-fn raster_space(mut f: impl FnMut([u8; RASTER])) {
+fn raster_space(mut f: impl FnMut([u8; RASTER]) -> std::ops::ControlFlow<()>) -> std::ops::ControlFlow<()> {
     let mut biases: Vec<i8> = (-16..=16).collect();
     biases.extend([-128, 127, 100, -100, 50, -50, 64, -64, 32, -32]);
     for fill in [2, 3] {
@@ -167,7 +185,7 @@ fn raster_space(mut f: impl FnMut([u8; RASTER])) {
                     let mut b = [0u8; RASTER];
                     b[..3].copy_from_slice(&[fill, cull, ccw]);
                     b[12..].copy_from_slice(&tail);
-                    f(b);
+                    f(b)?;
                     for &bias in &biases {
                         for slope in SLOPES {
                             if bias == 0 && slope == 0.0 {
@@ -175,13 +193,14 @@ fn raster_space(mut f: impl FnMut([u8; RASTER])) {
                             }
                             b[3] = bias as u8;
                             b[8..12].copy_from_slice(&slope.to_le_bytes());
-                            f(b);
+                            f(b)?;
                         }
                     }
                 }
             }
         }
     }
+    std::ops::ControlFlow::Continue(())
 }
 
 /// Stencil masks tried.
@@ -190,7 +209,7 @@ const MASKS: [u8; 19] = [
     0x00, 0x7F, 0xFE,
 ];
 
-fn depth_space(mut f: impl FnMut([u8; DEPTH])) {
+fn depth_space(mut f: impl FnMut([u8; DEPTH]) -> std::ops::ControlFlow<()>) -> std::ops::ControlFlow<()> {
     for enable in [0, 1] {
         for write in [0, 1] {
             for func in 1..=8 {
@@ -200,7 +219,7 @@ fn depth_space(mut f: impl FnMut([u8; DEPTH])) {
                         enable, write, func, 0, 0xFF, 0xFF, 1, 1, 1, 8, 1, 1, 1, 8,
                     ]);
                     b[22..].copy_from_slice(&tail);
-                    f(b);
+                    f(b)?;
                 }
                 // Stencil on, the same ops on both faces.
                 for read in MASKS {
@@ -213,7 +232,7 @@ fn depth_space(mut f: impl FnMut([u8; DEPTH])) {
                                 b[6..10].copy_from_slice(&face);
                                 b[10..14].copy_from_slice(&face);
                                 b[22..].copy_from_slice(&[1, 1]);
-                                f(b);
+                                f(b)?;
                             }
                         }
                     }
@@ -221,6 +240,7 @@ fn depth_space(mut f: impl FnMut([u8; DEPTH])) {
             }
         }
     }
+    std::ops::ControlFlow::Continue(())
 }
 
 /// The depth, stencil and blend registers of a pack record's register
@@ -936,8 +956,14 @@ mod tests {
 
     #[test]
     fn the_depth_space_holds_the_d3d12_default() {
-        let mut found = false;
-        depth_space(|b| found |= b[..6] == [1, 1, 2, 0, 0xFF, 0xFF] && b[22..] == [1, 1]);
+        let found = depth_space(|b| {
+            if b[..6] == [1, 1, 2, 0, 0xFF, 0xFF] && b[22..] == [1, 1] {
+                std::ops::ControlFlow::Break(())
+            } else {
+                std::ops::ControlFlow::Continue(())
+            }
+        })
+        .is_break();
         assert!(found);
     }
 
@@ -1075,5 +1101,46 @@ mod tests {
         let mut found = false;
         blend_from_registers(&regs, &[28, 0, 0, 0, 0, 0, 0, 0], |b| found |= b == want);
         assert!(found);
+    }
+
+    #[test]
+    fn space_enumerations_stop_early_when_wanted_empties() {
+        let mut depth_steps = 0usize;
+        let mut target_depth = [0u8; DEPTH];
+        let _ = depth_space(|b| {
+            depth_steps += 1;
+            if depth_steps == 3 {
+                target_depth = b;
+                std::ops::ControlFlow::Break(())
+            } else {
+                std::ops::ControlFlow::Continue(())
+            }
+        });
+        assert_eq!(depth_steps, 3);
+        let mut want = HashSet::from([city64(&target_depth)]);
+        let mut named = HashMap::new();
+        let mut visited = 0usize;
+        let _ = depth_space(|b| {
+            visited += 1;
+            let _ = try_one(&mut named, &mut want, &b);
+            if want.is_empty() {
+                std::ops::ControlFlow::Break(())
+            } else {
+                std::ops::ControlFlow::Continue(())
+            }
+        });
+        assert_eq!(visited, 3);
+        assert_eq!(named.get(&city64(&target_depth)), Some(&target_depth));
+
+        let mut raster_steps = 0usize;
+        let _ = raster_space(|_| {
+            raster_steps += 1;
+            if raster_steps == 5 {
+                std::ops::ControlFlow::Break(())
+            } else {
+                std::ops::ControlFlow::Continue(())
+            }
+        });
+        assert_eq!(raster_steps, 5);
     }
 }
