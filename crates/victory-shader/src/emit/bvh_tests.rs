@@ -714,8 +714,9 @@ fn case(rng: &mut Rng) -> (Vec<u32>, u32, Ray) {
     (w, ty, ray)
 }
 
-fn run_cases(wide: bool, batches: usize, memory: bool) {
+fn run_cases(wide: bool, batches: usize, memory: bool, high: bool) {
     let shader = build(wide, memory);
+    assert!(!high || !memory, "the 64-bit offset is the root descriptor path");
     // A program with the BVH instruction reads its root SRV as title
     // memory too.
     assert!(shader.memory);
@@ -747,11 +748,15 @@ fn run_cases(wide: bool, batches: usize, memory: bool) {
         }
         let (mut hits, mut tris) = (0, 0);
         for cases in &batches {
-            // Rays, then the nodes, 128 bytes each.
+            // Rays, then the nodes, 128 bytes each. With `high`, a second
+            // copy of the nodes `HIGH` bytes further into the host buffer,
+            // which the page table maps 4 GiB above `TITLE`: a node pointer
+            // with bit 29 set reaches it, a 32-bit shift the zeros below.
             let nodes = (LANES * 64) as u32;
-            let mut data = vec![0u32; LANES * 16 + LANES * 32];
+            let high_at = if high { HIGH as u32 / 4 } else { 0 };
+            let mut data = vec![0u32; LANES * 16 + LANES * 32 + high_at as usize];
             for (n, (w, ty, ray)) in cases.iter().enumerate() {
-                let ptr = (nodes + 128 * n as u32) >> 3 | ty;
+                let ptr = (nodes + 128 * n as u32) >> 3 | ty | if high { 1 << 29 } else { 0 };
                 let r = &mut data[16 * n..16 * n + 12];
                 r[0] = ptr;
                 r[1] = ray.extent.to_bits();
@@ -760,12 +765,17 @@ fn run_cases(wide: bool, batches: usize, memory: bool) {
                     r[5 + k] = ray.dir[k].to_bits();
                     r[8 + k] = ray.inv[k].to_bits();
                 }
-                let at = LANES * 16 + 32 * n;
+                let at = if high {
+                    (high_at + nodes / 4 + 32 * n as u32) as usize
+                } else {
+                    LANES * 16 + 32 * n
+                };
                 data[at..at + 28].copy_from_slice(w);
             }
+            let table = if high { page_table_high(1, 3) } else { page_table(1, 3) };
             let roots = vec![
                 (0, Root::Constants(ud.clone())),
-                (1, Root::View { srv: true, data: page_table(1, 3) }),
+                (1, Root::View { srv: true, data: table }),
                 (2, Root::Uav(2 * 4096 / 32)),
             ];
             let views = [
@@ -806,12 +816,12 @@ fn run_cases(wide: bool, batches: usize, memory: bool) {
 
 #[test]
 fn intersections_on_the_gpu_equal_the_reference() {
-    run_cases(false, 16, false);
+    run_cases(false, 16, false, false);
 }
 
 #[test]
 fn intersections_with_64_bit_pointers_on_the_gpu_equal_the_reference() {
-    run_cases(true, 8, false);
+    run_cases(true, 8, false, false);
 }
 
 /// The title address of the rays and nodes in the title-memory runs.
@@ -832,10 +842,39 @@ fn page_table(view: u32, null: u32) -> Vec<u32> {
     t
 }
 
+/// How far into the host buffer the copy of the nodes 4 GiB higher sits.
+const HIGH: usize = 64 << 10;
+
+/// [`page_table`], with the page 4 GiB higher too, mapped to the copy
+/// [`HIGH`] bytes into the buffer: a node pointer with bit 29 set reaches
+/// it.
+fn page_table_high(view: u32, null: u32) -> Vec<u32> {
+    let (hi, lo) = ((TITLE >> 32) as u32, TITLE as u32);
+    let mut t = page_table(view, null);
+    // Level 1 has 4096 entries, then blocks of 4096 two-dword entries.
+    t.resize(4096 + 3 * 8192, 0);
+    // 4 GiB is one more 256 MiB region: the level-1 index goes up by 16.
+    let l1 = ((hi << 4) | (lo >> 28)) as usize;
+    t[l1 + 16] = 2;
+    let page = (lo >> 16 & 0xFFF) as usize;
+    let at = 4096 + 2 * 8192 + 2 * page;
+    t[at..at + 2].copy_from_slice(&[view, lo.wrapping_sub(HIGH as u32)]);
+    t
+}
+
 /// The BVH at a pointer the program has in root constants: nodes (and
 /// rays) read through title memory.
 #[test]
 fn intersections_on_nodes_in_title_memory_equal_the_reference() {
-    run_cases(false, 4, true);
-    run_cases(true, 4, true);
+    run_cases(false, 4, true, false);
+    run_cases(true, 4, true, false);
+}
+
+/// A node pointer with bit 29 set (a node more than 2 GiB into the BVH)
+/// reads where it points: the page table maps the page 4 GiB higher to a
+/// second copy of the nodes, while the page below is zeros. A 32-bit shift
+/// wraps back to the zeros (#2368).
+#[test]
+fn a_node_pointer_above_two_gib_reads_where_it_points() {
+    run_cases(false, 2, false, true);
 }
