@@ -123,8 +123,9 @@ impl Drop for State {
 const MEMORY_HEAP: usize = crate::memory::OURS;
 
 /// The sampler heap we bind when the title binds none (a value no title heap
-/// address takes).
-const SAMPLERS_OURS: usize = usize::MAX;
+/// address takes). Not `usize::MAX`: with [`MEMORY_HEAP`] that would be
+/// the heaps [`State::host_state_lost`] says the host list has none of.
+const SAMPLERS_OURS: usize = usize::MAX - 1;
 
 /// Dynamic slots taken at a time for root views.
 const ROOT_VIEW_RUN: u32 = 256;
@@ -992,14 +993,19 @@ impl State {
     /// such a signature (the debug layer's id 1419), and breaking that rule
     /// removes the device on NVIDIA. Compute lists that only read views are
     /// the case: they bind no sampler heap, and every signature we make says
-    /// its sampler heap is indexed directly.
+    /// its sampler heap is indexed directly. Its view heap too: a list whose
+    /// shaders read neither title memory nor root views gets ours as well.
     fn wanted(title: [usize; 2], memory_heap: bool) -> [usize; 2] {
         let sampler = if title[1] != 0 {
             title[1]
         } else {
             SAMPLERS_OURS
         };
-        let views = if memory_heap { MEMORY_HEAP } else { title[0] };
+        let views = if memory_heap || title[0] == 0 {
+            MEMORY_HEAP
+        } else {
+            title[0]
+        };
         [views, sampler]
     }
 
@@ -1014,7 +1020,9 @@ impl State {
                 .filter_map(|&h| crate::descriptor::heap(h as This).host())
                 .map(|h| Some(h.heap.clone()))
                 .collect();
-            if memory_heap && let Some(h) = crate::memory::heap() {
+            if want[0] == MEMORY_HEAP
+                && let Some(h) = crate::memory::heap()
+            {
                 heaps.insert(0, Some(h.heap.clone()));
             }
             if want[1] == SAMPLERS_OURS {
@@ -2081,6 +2089,32 @@ mod tests {
         );
         // A title sampler heap stays whatever the views are.
         assert_eq!(State::wanted([0, 0x20], true), [MEMORY_HEAP, 0x20]);
+    }
+
+    /// Once the host list's state is lost (a cut into a new host list, which
+    /// starts with no heaps, or commands of another recorder), the next draw
+    /// or dispatch binds its heaps again, ours of both kinds too.
+    #[test]
+    fn heaps_are_bound_again_after_the_host_state_is_lost() {
+        let mut state = State::default();
+        state.host_state_lost();
+        for title in [[0, 0], [0x10, 0], [0, 0x20], [0x10, 0x20]] {
+            for memory_heap in [false, true] {
+                let want = State::wanted(title, memory_heap);
+                assert_ne!(want, state.host_heaps, "{title:x?}, memory heap {memory_heap}");
+            }
+        }
+    }
+
+    /// Every signature we make says its view heap is indexed directly too:
+    /// a list that binds no view heap gets ours, also when its shaders read
+    /// neither title memory nor root views (constants only).
+    #[test]
+    fn a_list_without_a_view_heap_gets_ours() {
+        assert_eq!(State::wanted([0, 0], false), [MEMORY_HEAP, SAMPLERS_OURS]);
+        assert_eq!(State::wanted([0, 0x20], false), [MEMORY_HEAP, 0x20]);
+        // A title view heap stays.
+        assert_eq!(State::wanted([0x10, 0x20], false), [0x10, 0x20]);
     }
     use crate::object::{HRESULT, S_OK};
     use windows::Win32::Graphics::Direct3D::Fxc::D3DCompile;
