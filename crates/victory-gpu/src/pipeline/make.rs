@@ -267,6 +267,10 @@ fn wait(p: &Pending, frame: u64) {
     WAITED_US.fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
 }
 
+/// Stack of each pipeline worker: room for the driver's shader compiler,
+/// which runs on it (reserved address space; committed only as used).
+const PIPELINE_STACK: usize = 64 << 20;
+
 /// Pipelines for the workers: those draws wait for, then those started
 /// early.
 static QUEUES: (Mutex<[VecDeque<Arc<Pending>>; 2]>, Condvar) =
@@ -282,6 +286,10 @@ fn queue(p: Arc<Pending>, now: bool) {
             .filter(|i| {
                 let spawned = std::thread::Builder::new()
                     .name(format!("victory-pipelines-{i}"))
+                    // The driver compiles pipelines on this thread, recursively:
+                    // NVIDIA's compiler (nvgpucomp64) overflowed the default 2 MB
+                    // on a world compute program and refused it as out of memory.
+                    .stack_size(PIPELINE_STACK)
                     .spawn(work);
                 if let Err(e) = &spawned {
                     tracing::warn!(error = %e, "no pipeline worker");
