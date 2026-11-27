@@ -84,6 +84,9 @@ pub(crate) struct Lowered {
     /// Whether depth and stencil are tested before it runs.
     #[cfg(test)]
     pub early_depth: bool,
+    /// Total incoming edges placed on loop-iteration counter phis.
+    #[cfg(test)]
+    pub counter_edges: usize,
 }
 
 /// `DB_SHADER_CONTROL.DEPTH_BEFORE_SHADER` (AMD's register headers, as in
@@ -416,6 +419,8 @@ struct Lower<'a> {
     /// Loop headers' iteration counters (see [`LOOP_LIMIT`]): the phi by
     /// IR block, and its incoming (value, DXIL block) pairs.
     counters: HashMap<usize, (V, Vec<(V, usize)>)>,
+    #[cfg(test)]
+    counter_edges: usize,
     /// The block a loop stopped by [`LOOP_LIMIT`] leaves the program from.
     abort: Option<usize>,
     /// The 16/64-bit round mode (MODE bits 3:2) each block starts with, and
@@ -1119,6 +1124,8 @@ impl<'a> Lower<'a> {
             section_out: HashSet::new(),
             code_table: None,
             counters: HashMap::new(),
+            #[cfg(test)]
+            counter_edges: 0,
             abort: None,
             round16: round16(p),
             mode16: Some(0),
@@ -1966,6 +1973,8 @@ impl<'a> Lower<'a> {
             has_half_wave_mask: self.s.m.has_i32_const(!31),
             #[cfg(test)]
             early_depth: self.s.flags & flags::EARLY_DEPTH != 0,
+            #[cfg(test)]
+            counter_edges: self.counter_edges,
             dxil: self.s.finish(),
             user_data,
             samplers: self.samplers,
@@ -11116,6 +11125,30 @@ impl<'a> Lower<'a> {
     fn branch_term(&mut self, b: usize, cond: V, taken: usize, not_taken: usize) -> Term {
         // A back edge is taken only below the iteration limit.
         let back = |l: &Self, to: usize| l.counters.contains_key(&to) && l.rpo[to] <= l.rpo[b];
+        if back(self, taken) && back(self, not_taken) {
+            if taken == not_taken {
+                let ok = self.count_iteration_from(self.cur, taken, pred::IULT);
+                let abort = self.abort_block();
+                return Term::CondBr(ok, self.block[taken].expect("reachable"), abort);
+            }
+            // Both arms are back edges (e.g. an inner latch
+            // returning to either the inner or outer loop header):
+            // guard each edge in its own block so both headers get
+            // their counter phi incoming edge and iteration limit.
+            let abort = self.abort_block();
+            let mut guard_back = |to: usize| {
+                let edge = self.s.m.new_block();
+                let ok = self.count_iteration_from(edge, to, pred::IULT);
+                self.s.m.terminate(
+                    edge,
+                    Term::CondBr(ok, self.block[to].expect("reachable"), abort),
+                );
+                self.edges.insert((b, to), edge);
+                edge
+            };
+            let (t, f) = (guard_back(taken), guard_back(not_taken));
+            return Term::CondBr(cond, t, f);
+        }
         // (No `xor` of a compare: a loop exit testing one hung the
         // AMD driver.)
         let cond = if back(self, taken) {
@@ -11355,7 +11388,10 @@ impl<'a> Lower<'a> {
     /// critical-edge block): the count goes up; the result compares it with
     /// [`LOOP_LIMIT`] by `p` (below: go on; at or above: stop).
     fn count_iteration(&mut self, to: usize, p: u8) -> V {
-        let c = self.cur;
+        self.count_iteration_from(self.cur, to, p)
+    }
+
+    fn count_iteration_from(&mut self, c: usize, to: usize, p: u8) -> V {
         let (phi, _) = self.counters[&to];
         let one = self.s.m.i32(1);
         let next = self.s.m.bin(c, Bin::Add, phi, one);
@@ -12004,6 +12040,10 @@ impl<'a> Lower<'a> {
             self.s.m.set_phi(v, incoming);
         }
         for (phi, incoming) in std::mem::take(&mut self.counters).into_values() {
+            #[cfg(test)]
+            {
+                self.counter_edges += incoming.len();
+            }
             self.s.m.set_phi(phi, incoming);
         }
         for b in 0..p.blocks.len() {

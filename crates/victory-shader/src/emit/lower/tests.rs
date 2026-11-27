@@ -1306,3 +1306,34 @@ fn ds_bpermute_refuses_gds() {
         Err(crate::ShaderError::Unsupported { what: "GDS", .. })
     ));
 }
+
+#[test]
+fn dual_back_edge_branch_counts_both_loop_headers() {
+    // Nested loop where the inner loop's conditional branch jumps back to
+    // `inner` when s1 != 2 and falls straight back into `outer` when s1 == 2,
+    // making both arms of the same `LaneExit::Branch` back edges.
+    let words = [
+        0xBE80_0380, // 0  entry: s_mov_b32 s0, 0
+        0xBF82_0003, // 1         s_branch -> 5 (outer)
+        0x8001_8101, // 2  inner: s_add_u32 s1, s1, 1
+        0xBF06_8201, // 3         s_cmp_eq_u32 s1, 2
+        0xBF84_FFFD, // 4         s_cbranch_scc0 -> 2 (inner); fallthrough -> 5 (outer)
+        0x8000_8100, // 5  outer: s_add_u32 s0, s0, 1
+        0xBF06_8200, // 6         s_cmp_eq_u32 s0, 2
+        0xBF85_0002, // 7         s_cbranch_scc1 -> 10 (exit)
+        0xBE81_0380, // 8  pre:   s_mov_b32 s1, 0
+        0xBF82_FFF8, // 9         s_branch -> 2 (inner)
+        S_ENDPGM,    // 10 exit:  s_endpgm
+    ];
+    let emitted = lower_with(&words, vec![], vec![]).unwrap();
+    // Both `outer` (entry + inner fallthrough) and `inner` (pre + self)
+    // must have both of their counter-phi incoming edges populated.
+    assert_eq!(emitted.counter_edges, 4);
+    #[cfg(windows)]
+    if let Ok(mut v) = super::super::validator::Validator::load(
+        super::super::validator::Validator::default_path().as_deref(),
+    ) {
+        v.validate(&mut emitted.dxil.clone())
+            .expect("DXIL validation failed");
+    }
+}
