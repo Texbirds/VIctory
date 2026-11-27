@@ -433,6 +433,33 @@ impl HostPipeline {
         for (s, _) in &stages {
             s.translated()?;
         }
+        // Mesh shaders whose standalone output footprint exceeds D3D12's 32 KiB
+        // limit are re-translated together with their paired pixel shader,
+        // pruning outputs the pixel shader never reads.
+        let linked = if let Some(ms) = mesh
+            && victory_shader::emit::mesh_output_bytes(&ms.translated()?.host.dxil)
+                .is_some_and(|n| n > victory_shader::emit::MESH_OUTPUT_LIMIT)
+        {
+            let Some(pair) = super::translate_linked(ms, find("pixel").map(Arc::as_ref)) else {
+                return refuse(
+                    "the mesh shader exceeds the 32 KiB output budget and could not be linked",
+                    shaders,
+                );
+            };
+            Some(pair)
+        } else {
+            None
+        };
+        let stages: Vec<(&Arc<Shader>, D3D12_SHADER_VISIBILITY)> = match &linked {
+            Some((ms, ps)) => {
+                let mut v = vec![(ms, D3D12_SHADER_VISIBILITY_MESH)];
+                if let Some(ps) = ps {
+                    v.push((ps, D3D12_SHADER_VISIBILITY_PIXEL));
+                }
+                v
+            }
+            None => stages,
+        };
         let host = host()?;
         // `SFI0`: 64-bit atomics on typed resources and on heap resources.
         let atomics64 = stages.iter().any(|(s, _)| {

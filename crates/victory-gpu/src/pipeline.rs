@@ -207,6 +207,112 @@ fn with_resources(
     Ok(Translated { host, used })
 }
 
+#[cfg(windows)]
+struct LinkedPair {
+    mesh: Arc<Shader>,
+    pixel: Option<Arc<Shader>>,
+}
+
+#[cfg(windows)]
+type LinkedKey = ([u8; 32], Option<[u8; 32]>);
+
+#[cfg(windows)]
+impl Shader {
+    fn from_translated(stage: &'static str, hash: String, translated: Translated) -> Arc<Shader> {
+        let cell = OnceLock::new();
+        let _ = cell.set(Some(translated));
+        Arc::new(Shader {
+            stage,
+            hash,
+            container: Vec::new(),
+            translated: cell,
+        })
+    }
+}
+
+/// Re-translates a mesh shader together with its paired pixel shader (if any)
+/// so arbitrary mesh outputs unread by the pixel shader are pruned under
+/// D3D12's 32 KiB mesh output limit (`victory_shader::emit::MESH_OUTPUT_LIMIT`).
+#[cfg(windows)]
+pub(crate) fn translate_linked(
+    ms: &Shader,
+    ps: Option<&Shader>,
+) -> Option<(Arc<Shader>, Option<Arc<Shader>>)> {
+    static LINKED: Mutex<Option<HashMap<LinkedKey, Option<LinkedPair>>>> = Mutex::new(None);
+    let key: LinkedKey = (
+        *blake3::hash(&ms.container).as_bytes(),
+        ps.map(|p| *blake3::hash(&p.container).as_bytes()),
+    );
+    if let Some(hit) = LINKED
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .as_ref()
+        .and_then(|m| m.get(&key))
+    {
+        return hit
+            .as_ref()
+            .map(|pair| (pair.mesh.clone(), pair.pixel.clone()));
+    }
+    let options = victory_shader::emit::Options {
+        view_marks: true,
+        ..Default::default()
+    };
+    let result = match victory_shader::emit::translate_linked(
+        &ms.container,
+        ps.map(|p| p.container.as_slice()),
+        options,
+    ) {
+        Ok((ms_host, ps_host)) => {
+            let ms_bytes = victory_shader::emit::mesh_output_bytes(&ms_host.dxil);
+            let ms_used = ms.translated()?.used.clone();
+            let mesh = Shader::from_translated(
+                ms.stage,
+                ms.hash.clone(),
+                Translated {
+                    host: ms_host,
+                    used: ms_used,
+                },
+            );
+            let pixel = match (ps, ps_host) {
+                (Some(p), Some(host)) => Some(Shader::from_translated(
+                    p.stage,
+                    p.hash.clone(),
+                    Translated {
+                        host,
+                        used: p.translated()?.used.clone(),
+                    },
+                )),
+                _ => None,
+            };
+            tracing::info!(
+                mesh = %ms.hash,
+                pixel = ps.map_or("none", |p| p.hash.as_str()),
+                bytes = ms_bytes,
+                "mesh and pixel linked under 32 KiB output budget"
+            );
+            Some(LinkedPair { mesh, pixel })
+        }
+        Err(e) => {
+            tracing::warn!(
+                mesh = %ms.hash,
+                pixel = ps.map_or("none", |p| p.hash.as_str()),
+                error = %e,
+                "linked mesh/pixel translation failed"
+            );
+            None
+        }
+    };
+    let out = result
+        .as_ref()
+        .map(|pair| (pair.mesh.clone(), pair.pixel.clone()));
+    LINKED
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get_or_insert_with(HashMap::new)
+        .insert(key, result);
+    out
+}
+
 #[repr(C)]
 struct Pipeline {
     object: Object,
