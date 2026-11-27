@@ -2148,4 +2148,101 @@ mod tests {
         ];
         assert!(emit_for(&compute(&words, true), NVIDIA).is_ok());
     }
+
+    /// A pixel shader where one path exports (`exp mrt0 ... done`) and another
+    /// skips the export (`s_cbranch_execz` jumping over it) before joining at a
+    /// shared `s_endpgm` block: only the lanes that skipped the export are
+    /// discarded, while exporting lanes keep their color.
+    #[test]
+    fn mixed_export_join_discards_only_non_exporting_lanes() {
+        // Console pattern: `v_cmpx_lt_f32` narrows EXEC to pixels with x > 4.0
+        // and `s_cbranch_execz` jumps past the `done` export directly to the
+        // shared `s_endpgm`, creating a mixed join at the exit block.
+        let words = [
+            0x7C22_00F6u32, // 0: v_cmpx_lt_f32 exec, 4.0, v0 (SV_Position.x > 4.0)
+            0xBF88_0005,    // 1: s_cbranch_execz +5 -> word 7 (s_endpgm)
+            0x7E02_02F2,    // 2: v_mov_b32 v1, 1.0
+            0x7E04_02F0,    // 3: v_mov_b32 v2, 0.5
+            0x7E06_0280,    // 4: v_mov_b32 v3, 0.0
+            0xF800_180F,    // 5: exp mrt0, v1, v2, v3, v1 done vm
+            0x0103_0201,    // 6:   vsrc0=v1, vsrc1=v2, vsrc2=v3, vsrc3=v1
+            0xBF81_0000,    // 7: s_endpgm
+        ];
+        let isg1 = rows(&[("SV_Position", 3, false)], true);
+        let osg1 = rows(&[("SV_Target", 16, false)], false);
+        // `emit_pixel` lowers the shader and runs dxil.dll validation on Windows.
+        let ps = emit_pixel(&words, vec![], 1 << 8, &isg1, &osg1).unwrap();
+        assert!(!ps.dxil.is_empty());
+        #[cfg(windows)]
+        {
+            use super::host::{Draw, Host};
+            let _one = super::valu_tests::ONE_AT_A_TIME
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            let mut s = Shader::new(false);
+            let b = s.entry;
+            let el = |name: &str, kind| SigElement {
+                name: name.into(),
+                index: 0,
+                kind,
+                comp: 9,
+                interp: 0,
+                row: Some(0),
+                col: 0,
+                cols: 4,
+                usage: 0xF,
+                half: false,
+            };
+            for col in 0..4u8 {
+                let load_args = [s.m.i32(0), s.m.i32(0), s.m.i8(col), s.m.undef(s.t.i32)];
+                let v = s.op(b, "loadInput.f32", Attr::ReadNone, s.t.f32, 4, &load_args);
+                let store_args = [s.m.i32(0), s.m.i32(0), s.m.i8(col), v];
+                s.op(b, "storeOutput.f32", Attr::NoUnwind, s.t.void, 5, &store_args);
+            }
+            s.inputs = vec![el("POSITION", 0)];
+            s.outputs = vec![el("SV_Position", 3)];
+            s.m.terminate(b, super::bitcode::Term::Ret);
+            let vs = s.finish();
+            #[rustfmt::skip]
+            let vertices = [
+                -1.0, -1.0, 0.5, 1.0,
+                -1.0,  3.0, 0.5, 1.0,
+                 3.0, -1.0, 0.5, 1.0,
+            ];
+            for (label, warp) in [("hardware", false), ("warp", true)] {
+                let Ok(host) = Host::new(warp) else {
+                    eprintln!("no SM 6.6 {label} device; skipped");
+                    continue;
+                };
+                let root = host.root_signature_for(&[]).unwrap();
+                let pso = host
+                    .pipeline_with(&root, &vs, &ps.dxil)
+                    .unwrap_or_else(|e| panic!("{label}: pipeline: {e}"));
+                let texels = host
+                    .draw(
+                        &root,
+                        &pso,
+                        &Draw {
+                            roots: Vec::new(),
+                            textures: &[],
+                            samplers: &[],
+                            vertices: &vertices,
+                            stride: 16,
+                            size: (16, 16),
+                            mesh_groups: 0,
+                        },
+                    )
+                    .unwrap_or_else(|e| panic!("{label}: draw: {e}"));
+                for (i, t) in texels.iter().enumerate() {
+                    let (x, y) = (i % 16, i / 16);
+                    let want = if x >= 4 {
+                        [1.0, 0.5, 0.0, 1.0]
+                    } else {
+                        [0.0; 4]
+                    };
+                    assert_eq!(*t, want, "{label}: pixel ({x}, {y})");
+                }
+            }
+        }
+    }
 }
