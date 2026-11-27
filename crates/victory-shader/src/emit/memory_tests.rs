@@ -633,53 +633,7 @@ fn writes_through_views_mark_their_pages() {
 /// table read makes its slot on the host).
 #[test]
 fn heap_direct_texture_reads_mark_their_heap_index() {
-    let lower_with = |root: RootType, used: Vec<UsedResource>, offset: u32| {
-        let mut w = vec![s_mov_b32(5, ZERO as u8)];
-        w.extend(s_load(3, 12, 4, offset));
-        w.push(S_WAITCNT_ALL);
-        w.extend((0..2).map(|v| v_mov_b32(v, ZERO)));
-        // image_load v[2:5], v[0:1], s[12:19] dmask:0xf dim:2D unorm
-        w.extend([0xF000_1F08, 0x0003_0200]);
-        w.push(S_WAITCNT_ALL);
-        w.push(S_ENDPGM);
-        let native = NativeProgram {
-            stage: HwStage::Cs,
-            wave64: false,
-            vgprs: 8,
-            layout: vec![RootParam {
-                root,
-                table_offset_dwords: 0,
-                sgprs: 1,
-                base_register: 0,
-                user_data: 4,
-                slot: 0,
-            }],
-            used,
-            io: StageIo::Cs(ComputeIo {
-                rsrc2: 5 << 1,
-                threads: [1, 1, 1],
-            }),
-            code: w.iter().flat_map(|w| w.to_le_bytes()).collect(),
-        };
-        let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
-        let st = structure::structure(&p).expect("structure");
-        let res = resource::track(&p, &native.layout, native.stage, Some(&st)).expect("track");
-        let io = io::raise(&p, &native).expect("io::raise");
-        lower::lower(&lower::Parts {
-            native: &native,
-            p: &p,
-            st: &st,
-            io: &io,
-            res: &res,
-            inputs: Vec::new(),
-            outputs: Vec::new(),
-            prims: Vec::new(),
-            mesh_stride: 0,
-            view_marks: true,
-        })
-        .expect("lower")
-    };
-    let table = lower_with(
+    let table = lower_texture_read(
         RootType::Table,
         vec![UsedResource {
             kind: ResourceType::Srv,
@@ -692,9 +646,81 @@ fn heap_direct_texture_reads_mark_their_heap_index() {
             slot: 0,
         }],
         0,
+        1,
+        None,
     );
     assert!(!table.view_marks, "a table read marks nothing");
-    let l = lower_with(RootType::ResourceHeap, Vec::new(), 32);
+    check_heap_direct_texture_read_marks(1, None, &[super::VIEW_READS as usize + 1]);
+}
+
+#[test]
+fn heap_direct_texture_reads_skip_marks_when_exec_is_zero() {
+    // v_cmpx_ne_u32 exec_lo, v0, v0: no lane reaches the load with EXEC set.
+    check_heap_direct_texture_read_marks(1, Some(0x7DAA_0100), &[]);
+}
+
+#[test]
+fn heap_direct_texture_reads_mark_with_partial_exec() {
+    // v_cmpx_eq_u32 exec_lo, 0, v0: only thread 0 reads slot 1.
+    check_heap_direct_texture_read_marks(2, Some(0x7DA4_0080), &[super::VIEW_READS as usize + 1]);
+}
+
+fn lower_texture_read(
+    root: RootType,
+    used: Vec<UsedResource>,
+    offset: u32,
+    threads: u32,
+    exec: Option<u32>,
+) -> lower::Lowered {
+    let mut w = vec![s_mov_b32(5, ZERO as u8)];
+    w.extend(s_load(3, 12, 4, offset));
+    w.push(S_WAITCNT_ALL);
+    w.extend((1..3).map(|v| v_mov_b32(v, ZERO)));
+    w.extend(exec);
+    // image_load v[3:6], v[1:2], s[12:19] dmask:0xf dim:2D unorm
+    w.extend([0xF000_1F08, 0x0003_0301]);
+    w.push(S_WAITCNT_ALL);
+    w.push(S_ENDPGM);
+    let native = NativeProgram {
+        stage: HwStage::Cs,
+        wave64: false,
+        vgprs: 8,
+        layout: vec![RootParam {
+            root,
+            table_offset_dwords: 0,
+            sgprs: 1,
+            base_register: 0,
+            user_data: 4,
+            slot: 0,
+        }],
+        used,
+        io: StageIo::Cs(ComputeIo {
+            rsrc2: 5 << 1,
+            threads: [threads, 1, 1],
+        }),
+        code: w.iter().flat_map(|w| w.to_le_bytes()).collect(),
+    };
+    let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
+    let st = structure::structure(&p).expect("structure");
+    let res = resource::track(&p, &native.layout, native.stage, Some(&st)).expect("track");
+    let io = io::raise(&p, &native).expect("io::raise");
+    lower::lower(&lower::Parts {
+        native: &native,
+        p: &p,
+        st: &st,
+        io: &io,
+        res: &res,
+        inputs: Vec::new(),
+        outputs: Vec::new(),
+        prims: Vec::new(),
+        mesh_stride: 0,
+        view_marks: true,
+    })
+    .expect("lower")
+}
+
+fn check_heap_direct_texture_read_marks(threads: u32, exec: Option<u32>, expected: &[usize]) {
+    let l = lower_texture_read(RootType::ResourceHeap, Vec::new(), 32, threads, exec);
     assert!(l.view_marks && l.heap, "a heap-direct read is marked");
     let shader = HostShader {
         stage: HwStage::Cs,
@@ -714,6 +740,8 @@ fn heap_direct_texture_reads_mark_their_heap_index() {
     };
     if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
         v.validate(&mut shader.dxil.clone()).expect("DXIL validation failed");
+    } else {
+        eprintln!("no dxil.dll; validation skipped");
     }
     let _one = super::valu_tests::ONE_AT_A_TIME
         .lock()
@@ -728,7 +756,7 @@ fn heap_direct_texture_reads_mark_their_heap_index() {
         };
         let (root, pso) = host.compute_pipeline(&shader).expect("pipeline");
         // The heap's base is 0 in the user data (`emit`, "Binding").
-        let ud = vec![0u32; shader.user_data_dwords() as usize];
+        let ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
         let out = host
             .dispatch(
                 &root,
@@ -747,7 +775,7 @@ fn heap_direct_texture_reads_mark_their_heap_index() {
             .unwrap_or_else(|e| panic!("{label}: {e}"));
         let bits = &out[0];
         let marked: Vec<usize> = (0..bits.len() * 32).filter(|&b| bits[b / 32] >> (b % 32) & 1 != 0).collect();
-        assert_eq!(marked, [super::VIEW_READS as usize + 1], "{label}: the slot read");
+        assert_eq!(marked, expected, "{label}: the slots read");
         ran += 1;
     }
     assert!(ran > 0, "neither hardware nor WARP SM 6.6 device available");
