@@ -1922,9 +1922,10 @@ impl HostList {
         }
     }
 
-    /// Only after the list's last submission finished (every one is waited
-    /// for).
-    pub(crate) fn reset(&self) {
+    /// Drops resources and state tracked by this list without resetting the
+    /// D3D12 command allocator or command list (only after the list's last
+    /// submission finished).
+    pub(crate) fn clear_held(&self) {
         *self.deferred() = Deferred::default();
         self.states.lock().unwrap_or_else(|e| e.into_inner()).clear();
         self.twins.lock().unwrap_or_else(|e| e.into_inner()).clear();
@@ -1933,6 +1934,12 @@ impl HostList {
         self.notes.lock().unwrap_or_else(|e| e.into_inner()).clear();
         #[cfg(feature = "diagnostics")]
         self.targets.lock().unwrap_or_else(|e| e.into_inner()).clear();
+    }
+
+    /// Only after the list's last submission finished (every one is waited
+    /// for).
+    pub(crate) fn reset(&self) {
+        self.clear_held();
         {
             let mut scratch = self.scratch.lock().unwrap_or_else(|e| e.into_inner());
             (scratch.current, scratch.used) = (0, 0);
