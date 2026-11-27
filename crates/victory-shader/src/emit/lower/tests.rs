@@ -1,9 +1,4 @@
-//! Tests of `lower`, a child module of it (kept in their own file so that
-//! `lower.rs` stays under the asset policy's file-size limit).
-
-use super::{
-    Lowered, Numeric, Parts, buffer_format, code_table_start, half_shift, lower, packed_half,
-};
+use super::{Lowered, Numeric, Parts, buffer_format, code_table_start, half_shift, lower, packed_half};
 use crate::native::{
     ComputeIo, HwStage, NativeProgram, ResourceType, RootParam, RootType, StageIo, UsedResource,
 };
@@ -38,6 +33,12 @@ fn the_code_table_starts_after_the_instructions() {
 
 /// Whether a synthetic compute program translates with these input registers.
 fn lowers(words: &[u32], rsrc2: u32) -> Result<(), crate::ShaderError> {
+    lowers_as(words, rsrc2, false)
+}
+
+/// [`lowers`], kept to the per-lane form with `per_lane_only` (what
+/// `emit` falls back to when the console flow cannot lower a program).
+fn lowers_as(words: &[u32], rsrc2: u32, per_lane_only: bool) -> Result<(), crate::ShaderError> {
     let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
     let native = NativeProgram {
         stage: HwStage::Cs,
@@ -65,6 +66,9 @@ fn lowers(words: &[u32], rsrc2: u32) -> Result<(), crate::ShaderError> {
         outputs: vec![],
         prims: vec![],
         mesh_stride: 0,
+        target: super::super::Target::ANY,
+        console_cf: false,
+        per_lane_only,
         view_marks: false,
     })
     .map(|_| ())
@@ -116,6 +120,9 @@ fn lower_wave(
         outputs: vec![],
         prims: vec![],
         mesh_stride: 0,
+        target: crate::emit::Target::ANY,
+        console_cf: false,
+        per_lane_only: false,
         view_marks: false,
     })
 }
@@ -181,11 +188,16 @@ fn vop3_conversion_modifiers_affect_the_lowering() {
         (0x0B, 1 << 8, 0, "abs"),
         (0x0B, 0, 1 << 29, "neg"),
     ] {
-        let vop1 = lower_valu(&[0x7E00_0000 | op << 9 | 0x101]).unwrap().dxil;
+        let vop1 = lower_valu(&[0x7E00_0000 | op << 9 | 0x101])
+            .unwrap()
+            .dxil;
         let vop3 = |first: u32, second: u32| {
-            lower_valu(&[0xD400_0000 | (0x180 + op) << 16 | first, 0x101 | second])
-                .unwrap()
-                .dxil
+            lower_valu(&[
+                0xD400_0000 | (0x180 + op) << 16 | first,
+                0x101 | second,
+            ])
+            .unwrap()
+            .dxil
         };
         assert_eq!(vop1, vop3(0, 0), "VOP1/VOP3 control for op {op:#x}");
         assert_ne!(
@@ -220,14 +232,8 @@ fn sums_of_absolute_differences_lower() {
 fn buffer_cache_invalidations_lower_as_no_ops() {
     // MUBUF opcode 0x071/0x072 with no data operand: the title asks the
     // host to invalidate its cached view of a buffer.
-    assert!(
-        lowers(&[0xE1C4_0000, 0, S_ENDPGM], 0).is_ok(),
-        "buffer_gl0_inv"
-    );
-    assert!(
-        lowers(&[0xE1C8_0000, 0, S_ENDPGM], 0).is_ok(),
-        "buffer_gl1_inv"
-    );
+    assert!(lowers(&[0xE1C4_0000, 0, S_ENDPGM], 0).is_ok(), "buffer_gl0_inv");
+    assert!(lowers(&[0xE1C8_0000, 0, S_ENDPGM], 0).is_ok(), "buffer_gl1_inv");
 }
 
 #[test]
@@ -271,11 +277,11 @@ fn v_cndmask_accepts_uniform_and_constant_masks() {
         0xBF06_8000u32, // s_cmp_eq_u32 s0, 0
         0x8500_80C1,    // s_cselect_b32 s0, -1, 0
         0xD501_0001,
-        0x0001_0080, // v_cndmask_b32 v1, 0, 1, s0
+        0x0001_0080,    // v_cndmask_b32 v1, 0, 1, s0
         0xD501_0002,
-        0x0201_02C1, // v_cndmask_b32 v2, 1, v1, -1
+        0x0201_02C1,    // v_cndmask_b32 v2, 1, v1, -1
         0xD834_0000,
-        0x0000_0200, // ds_write_b32 v0, v2
+        0x0000_0200,    // ds_write_b32 v0, v2
         S_ENDPGM,
     ];
     lowers(&words, 0x8001).unwrap();
@@ -337,6 +343,9 @@ fn perm_features(selector: u32) -> u64 {
         outputs: vec![],
         prims: vec![],
         mesh_stride: 0,
+        target: super::super::Target::ANY,
+        console_cf: false,
+        per_lane_only: false,
         view_marks: false,
     })
     .unwrap();
@@ -916,7 +925,9 @@ fn a_scalar_result_needs_no_exec() {
         0xBEFE_0304, // s_mov_b32 exec_lo, s4
         S_ENDPGM,
     ];
-    lowers(&words, 1 << 7).expect("a lane read under an EXEC with no mask");
+    // A `v_readlane` past a per-lane branch asks for the console flow
+    // first (#439); the per-lane form is what this test is about.
+    lowers_as(&words, 1 << 7, true).expect("a lane read under an EXEC with no mask");
 }
 
 #[test]
@@ -967,7 +978,7 @@ fn guarded_or_modified_v_mov_b32_is_not_folded_as_constant() {
     // matching the compare after the join so s6 is live.
     let mut negated = [
         0xF490_0180,
-        0, // s_memtime s[6:7]
+        0,           // s_memtime s[6:7]
         0xD581_0001,
         0x2000_00F2, // v_mov_b32_e64 v1, -(1.0)
         0xBF06_8000, // s_cmp_eq_u32 s0, 0
@@ -1259,6 +1270,9 @@ fn ds_bpermute_wave64_preserves_32_lane_half() {
             outputs: vec![],
             prims: vec![],
             mesh_stride: 0,
+            target: crate::emit::Target::ANY,
+            console_cf: false,
+            per_lane_only: false,
             view_marks: false,
         })
         .unwrap();
