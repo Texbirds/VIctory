@@ -2812,6 +2812,99 @@ mod tests {
         assert_eq!(slot::<Release>(h, 0x10)(h), 0);
     }
 
+    #[cfg(all(windows, feature = "diagnostics"))]
+    #[test]
+    fn multisampled_color_targets_are_captured() {
+        use windows::Win32::Graphics::Direct3D12::*;
+        use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R8G8B8A8_UNORM;
+
+        let Some(host) = crate::host::host() else {
+            eprintln!("4x color target unavailable; skipped");
+            return;
+        };
+        let mut levels = D3D12_FEATURE_DATA_MULTISAMPLE_QUALITY_LEVELS {
+            Format: DXGI_FORMAT_R8G8B8A8_UNORM,
+            SampleCount: 4,
+            ..Default::default()
+        };
+        // SAFETY: valid storage for a D3D12 multisample capabilities query.
+        let queried = unsafe {
+            host.device.CheckFeatureSupport(
+                D3D12_FEATURE_MULTISAMPLE_QUALITY_LEVELS,
+                (&raw mut levels).cast(),
+                std::mem::size_of_val(&levels) as u32,
+            )
+        };
+        if queried.is_err() || levels.NumQualityLevels == 0 {
+            eprintln!("4x color target unavailable; skipped");
+            return;
+        }
+        let desc = ResourceDesc {
+            flags: D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET.0 as u32,
+            sample_count: 4,
+            ..texture(4, 4, DXGI_FORMAT_R8G8B8A8_UNORM.0 as u32, 1)
+        };
+        let null = std::ptr::null();
+        let mut resource = null;
+        assert_eq!(
+            create_committed(null, &PROPERTIES, 0, &desc, 0, null.cast(), &RESOURCE_IIDS[0], &mut resource),
+            S_OK,
+        );
+        let target = host_copy(resource).expect("host 4x render target");
+        // SAFETY: the reference keeps the texture alive during the query.
+        assert_eq!(unsafe { target.texture.GetDesc() }.SampleDesc.Count, 4);
+        let state = D3D12_RESOURCE_STATES(target.state.load(std::sync::atomic::Ordering::Relaxed) as i32);
+        let render = D3D12_RESOURCE_STATE_RENDER_TARGET;
+        let clear = |color: [f32; 4], note: bool| {
+            let list = host.new_list().unwrap();
+            let rtv = host.rtv(&target.texture, None);
+            // SAFETY: a live render target and an open list, with both transitions paired.
+            unsafe {
+                if state != render {
+                    list.list.ResourceBarrier(&[crate::host::transition(&target.texture, state, render)]);
+                }
+                list.list.ClearRenderTargetView(rtv, &color, None);
+                if state != render {
+                    list.list.ResourceBarrier(&[crate::host::transition(&target.texture, render, state)]);
+                }
+            }
+            if note {
+                crate::capture::note_test_target(&list, resource);
+            }
+            list.close();
+            host.execute(&[&list]);
+        };
+        let dir = tempfile::tempdir().unwrap();
+        crate::capture::with_test_capture(dir.path(), || {
+            // The first clear is recorded and dumped by the submission.
+            clear([0.0, 1.0, 0.0, 1.0], true);
+            // The present dump reads the same target after the second clear.
+            clear([1.0, 0.0, 0.0, 1.0], false);
+            crate::capture::dump_targets(crate::queue::presented() + 1);
+        });
+        assert_eq!(slot::<Release>(resource, 0x10)(resource), 0);
+
+        let mut pngs: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .filter(|path| path.extension().is_some_and(|ext| ext == "png"))
+            .collect();
+        let is_submission = |path: &std::path::Path| {
+            path.file_name().unwrap().to_str().unwrap().split('-').nth(2).unwrap().starts_with('s')
+        };
+        pngs.sort_by_key(|path| is_submission(path));
+        println!("4x color target produced {} PNGs", pngs.len());
+        assert_eq!(pngs.len(), 2, "expected one present PNG and one submission PNG");
+        for (index, (path, [r, g, b])) in pngs.iter().zip([[255, 0, 0], [0, 255, 0]]).enumerate() {
+            assert_eq!(is_submission(path), index == 1);
+            let png = std::fs::read(path).unwrap();
+            let word = |at| u32::from_be_bytes(png[at..at + 4].try_into().unwrap());
+            assert_eq!([word(16), word(20)], [2, 2]);
+            let rgb = miniz_oxide::inflate::decompress_to_vec_zlib(&png[41..41 + word(33) as usize]).unwrap();
+            assert_eq!(rgb, [0, r, g, b, r, g, b].repeat(2));
+        }
+    }
+
     /// Host textures the GPU writes (render target, depth, unordered access)
     /// are never given up, and the title releasing its texture frees its
     /// host texture (nothing else holds it); one fed from title memory is

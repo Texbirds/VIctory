@@ -22,6 +22,10 @@ pub(crate) fn folder() -> Option<&'static PathBuf> {
 /// lists frames counted from the first one that ran 500 draws (the world's
 /// first, whose number depends on how fast the title loaded).
 pub(crate) fn listed(n: u64) -> bool {
+    #[cfg(test)]
+    if with_test_state(|_| ()).is_some() {
+        return true;
+    }
     static LIST: std::sync::OnceLock<Vec<u64>> = std::sync::OnceLock::new();
     LIST.get_or_init(|| numbers("VICTORY_CAPTURE_FRAMES")).contains(&n)
         || WORLD
@@ -80,7 +84,16 @@ pub(crate) fn save(n: u64, width: u32, height: u32, pitch: usize, bgra: bool, ro
 
 /// Saves 8-bit RGBA or BGRA rows as `<name>.png`, at half size.
 fn save_as(name: &str, width: u32, height: u32, pitch: usize, bgra: bool, rows: &[u8]) {
-    let Some(folder) = folder() else { return };
+    #[cfg(test)]
+    let test_folder = with_test_state(|capture| capture.folder.clone());
+    #[cfg(test)]
+    let folder = match &test_folder {
+        Some(folder) => Some(folder),
+        None => folder(),
+    };
+    #[cfg(not(test))]
+    let folder = folder();
+    let Some(folder) = folder else { return };
     let (w, h) = ((width / 2).max(1), (height / 2).max(1));
     // Filter byte 0 per row, then RGB of every other pixel of every other row.
     let mut raw = Vec::with_capacity((w as usize * 3 + 1) * h as usize);
@@ -248,10 +261,54 @@ pub(crate) fn save_read_back(
 /// (`-by-<pipeline>` in the name; `-black` when its colour is all zeros).
 /// `VICTORY_DUMP_WRITERS` (shader hashes) adds, in any frame, the textures
 /// a pipeline with one of them writes, the first frame it runs.
-#[allow(clippy::type_complexity)]
-static TARGETS: std::sync::Mutex<
-    Vec<(usize, std::sync::Arc<crate::resource::HostTexture>, String)>,
-> = std::sync::Mutex::new(Vec::new());
+type Targets = Vec<(usize, std::sync::Arc<crate::resource::HostTexture>, String)>;
+static TARGETS: std::sync::Mutex<Targets> = std::sync::Mutex::new(Vec::new());
+
+fn with_targets<R, F: FnOnce(&mut Targets) -> R>(f: F) -> R {
+    let global = |f: F| f(&mut TARGETS.lock().unwrap_or_else(|e| e.into_inner()));
+    #[cfg(test)]
+    return TEST_CAPTURE.with(|slot| match slot.borrow_mut().as_mut() {
+        Some(capture) => f(&mut capture.targets),
+        None => global(f),
+    });
+    #[cfg(not(test))]
+    global(f)
+}
+
+#[cfg(test)]
+struct TestCapture {
+    folder: PathBuf,
+    targets: Targets,
+}
+
+#[cfg(test)]
+thread_local! {
+    static TEST_CAPTURE: std::cell::RefCell<Option<TestCapture>> = const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+fn with_test_state<R>(f: impl FnOnce(&mut TestCapture) -> R) -> Option<R> {
+    TEST_CAPTURE.with(|slot| slot.borrow_mut().as_mut().map(f))
+}
+
+/// Records and submits a synthetic capture on this test's thread.
+#[cfg(test)]
+pub(crate) fn with_test_capture(folder: &std::path::Path, test: impl FnOnce()) {
+    struct Reset;
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            TEST_CAPTURE.with(|slot| slot.take());
+            WRITER.with(|writer| writer.borrow_mut().clear());
+        }
+    }
+    TEST_CAPTURE.with(|slot| {
+        assert!(slot.borrow().is_none(), "nested capture test");
+        slot.replace(Some(TestCapture { folder: folder.into(), targets: Vec::new() }));
+    });
+    binding("");
+    let _reset = Reset;
+    test();
+}
 
 thread_local! {
     /// The pipeline whose draw or dispatch this thread is binding.
@@ -266,6 +323,10 @@ pub(crate) fn binding(pipeline: &str) {
 }
 
 pub(crate) fn dump_on() -> bool {
+    #[cfg(test)]
+    if with_test_state(|_| ()).is_some() {
+        return true;
+    }
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| folder().is_some() && crate::switch::on("VICTORY_DUMP_TARGETS"))
 }
@@ -325,8 +386,12 @@ pub(crate) fn has_targets() -> bool {
 
 /// At the present of frame `frame`: saves the noted targets.
 pub(crate) fn dump_targets(frame: u64) {
-    use std::sync::atomic::Ordering::Relaxed;
-    let targets = std::mem::take(&mut *TARGETS.lock().unwrap_or_else(|e| e.into_inner()));
+    let targets = with_targets(std::mem::take);
+    #[cfg(test)]
+    if with_test_state(|_| ()).is_some() {
+        dump_target_images(frame, &targets);
+        return;
+    }
     let buffers = std::mem::take(&mut *BUFFERS.lock().unwrap_or_else(|e| e.into_inner()));
     // Writers dumped once.
     if let Some(writers) = WRITERS.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
@@ -356,12 +421,17 @@ pub(crate) fn dump_targets(frame: u64) {
             "a buffer the named pipeline writes, at the present"
         );
     }
+    dump_target_images(frame, &targets);
+}
+
+fn dump_target_images(frame: u64, targets: &Targets) {
+    use std::sync::atomic::Ordering::Relaxed;
     let Some(host) = crate::host::host() else { return };
     for (i, (resource, copy, by)) in targets.iter().enumerate() {
         let texture = &copy.texture;
         // SAFETY: a live resource.
         let d = unsafe { texture.GetDesc() };
-        if d.SampleDesc.Count > 1 || d.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER {
+        if d.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER {
             continue;
         }
         // Every submission has run; the dump's list moves it there and back.
@@ -386,12 +456,15 @@ pub(crate) fn dump_submission(sub: u64, targets: &[(usize, String)]) {
         let texture = &copy.texture;
         // SAFETY: a live resource.
         let d = unsafe { texture.GetDesc() };
-        if d.SampleDesc.Count > 1 || d.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER {
+        if d.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER {
             continue;
         }
         let state = copy.state.load(Relaxed);
         let target = (i, *resource as crate::object::This, by.as_str());
         dump_one(host, texture, state, &format!("frame-{frame}-s{sub:04}"), target, &d);
+        if d.SampleDesc.Count > 1 {
+            continue;
+        }
         // A depth texture's writable twin (`crate::twin`): what unordered
         // views wrote, which reaches the depth texture at its next use.
         for (p, plane) in copy.twin.get().and_then(Option::as_ref).iter().flat_map(|t| t.planes.iter().enumerate()) {
@@ -531,6 +604,61 @@ pub(crate) fn read_indirect(
     }
 }
 
+/// A single-sampled copy target for a typed color format the host can resolve.
+fn resolve_destination(
+    device: &ID3D12Device,
+    source: &D3D12_RESOURCE_DESC,
+) -> Option<ID3D12Resource> {
+    if source.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D
+        || source.Flags.0 & D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL.0 != 0
+    {
+        return None;
+    }
+    let mut support = D3D12_FEATURE_DATA_FORMAT_SUPPORT {
+        Format: source.Format,
+        ..Default::default()
+    };
+    // SAFETY: the query has correctly typed writable storage.
+    unsafe {
+        device.CheckFeatureSupport(
+            D3D12_FEATURE_FORMAT_SUPPORT,
+            (&raw mut support).cast(),
+            std::mem::size_of_val(&support) as u32,
+        )
+    }
+    .ok()?;
+    let required = D3D12_FORMAT_SUPPORT1_RENDER_TARGET.0 | D3D12_FORMAT_SUPPORT1_MULTISAMPLE_RESOLVE.0;
+    if support.Support1.0 & required != required {
+        return None;
+    }
+
+    let desc = D3D12_RESOURCE_DESC {
+        Alignment: 0,
+        SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+        Layout: D3D12_TEXTURE_LAYOUT_UNKNOWN,
+        Flags: D3D12_RESOURCE_FLAG_NONE,
+        ..*source
+    };
+    let heap = D3D12_HEAP_PROPERTIES {
+        Type: D3D12_HEAP_TYPE_DEFAULT,
+        ..Default::default()
+    };
+    let mut target = None;
+    // SAFETY: a valid, single-sampled description and writable output.
+    unsafe {
+        device.CreateCommittedResource(
+            &heap,
+            D3D12_HEAP_FLAG_NONE,
+            &desc,
+            D3D12_RESOURCE_STATE_RESOLVE_DEST,
+            None,
+            &mut target,
+        )
+    }
+    .ok()?;
+    target
+}
+
 fn dump_one(
     host: &crate::host::Host,
     texture: &ID3D12Resource,
@@ -539,19 +667,38 @@ fn dump_one(
     (i, resource, by): (usize, crate::object::This, &str),
     d: &D3D12_RESOURCE_DESC,
 ) {
+    let resolved = if d.SampleDesc.Count > 1 {
+        let Some(target) = resolve_destination(&host.device, d) else { return };
+        Some(target)
+    } else {
+        None
+    };
     let Ok(list) = host.new_list() else { return };
     let state = D3D12_RESOURCE_STATES(crate::host::legal_state(texture, state) as i32);
     let copy = D3D12_RESOURCE_STATE_COPY_SOURCE;
-    // SAFETY: an open list of ours and a live texture.
+    let source = if resolved.is_some() { D3D12_RESOURCE_STATE_RESOLVE_SOURCE } else { copy };
+    // SAFETY: an open list and live textures. The resolved texture is kept
+    // through execution, and the source goes back to its original state.
     let read = unsafe {
-        if state != copy {
+        if state != source {
             list.list
-                .ResourceBarrier(&[crate::host::transition(texture, state, copy)]);
+                .ResourceBarrier(&[crate::host::transition(texture, state, source)]);
         }
-        let read = read_back(&host.device, &list.list, texture);
-        if state != copy {
+        let read_texture = if let Some(target) = &resolved {
+            list.list.ResolveSubresource(target, 0, texture, 0, d.Format);
+            list.list.ResourceBarrier(&[crate::host::transition(
+                target,
+                D3D12_RESOURCE_STATE_RESOLVE_DEST,
+                copy,
+            )]);
+            target
+        } else {
+            texture
+        };
+        let read = read_back(&host.device, &list.list, read_texture);
+        if state != source {
             list.list
-                .ResourceBarrier(&[crate::host::transition(texture, copy, state)]);
+                .ResourceBarrier(&[crate::host::transition(texture, source, state)]);
         }
         read
     };
@@ -929,6 +1076,15 @@ static LEVELS: std::sync::Mutex<std::collections::VecDeque<u8>> =
 pub(crate) fn recent_levels() -> Vec<u8> {
     let levels = LEVELS.lock().unwrap_or_else(|e| e.into_inner());
     levels.iter().copied().collect()
+}
+
+#[cfg(test)]
+pub(crate) fn note_test_target(list: &crate::host::HostList, resource: crate::object::This) {
+    let copy = crate::resource::host_copy(resource).expect("host texture for the capture test");
+    let address = resource as usize;
+    list.note_target(address, "");
+    with_test_state(|capture| capture.targets.push((address, copy, String::new())))
+        .expect("capture test scope");
 }
 
 #[cfg(test)]
