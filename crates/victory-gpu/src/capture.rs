@@ -680,6 +680,8 @@ fn to_rgba(format: u32, w: usize, h: usize, pitch: usize, rows: &[u8]) -> Option
         1..=2 => (16, Box::new(move |b| {
             [0, 1, 2].map(|i| f32::from_bits(u32_at(b, i)))
         })),
+        // R32G32B32A32_UINT: decode the RGB channels as unsigned integers.
+        3 => (16, Box::new(move |b| [0, 1, 2].map(|i| u32_at(b, i) as f32))),
         15..=16 => (8, Box::new(move |b| [f32::from_bits(u32_at(b, 0)), f32::from_bits(u32_at(b, 1)), 0.0])),
         35..=38 => (4, Box::new(move |b| [f32::from(u16_at(b, 0)), f32::from(u16_at(b, 1)), 0.0])),
         48..=52 => (2, Box::new(move |b| [f32::from(b[0]), f32::from(b[1]), 0.0])),
@@ -962,6 +964,22 @@ mod tests {
     #[test]
     fn crc_matches_the_png_check_value() {
         assert_eq!(super::crc32(b"IEND"), 0xae42_6082);
+    }
+
+    #[test]
+    fn rgba32_uint_captures_keep_rgb_and_ignore_source_alpha() {
+        let format = super::DXGI_FORMAT_R32G32B32A32_UINT.0 as u32;
+        let rows: Vec<_> = [
+            0x8000_0000, 0x4000_0000, 0, u32::MAX, u32::MAX,
+            0, 0x2000_0000, 0x8000_0000, 0,
+        ]
+        .into_iter()
+        .flat_map(u32::to_le_bytes)
+        .collect();
+        assert_eq!(
+            super::to_rgba(format, 1, 2, 20, &rows),
+            Some(vec![255, 127, 0, 255, 0, 63, 255, 255])
+        );
     }
 
     /// R16G16B16A16_UNORM is integers, not half floats; 89 is 10:10:10:2,
