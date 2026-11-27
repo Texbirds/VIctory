@@ -1021,6 +1021,32 @@ enum Step {
     Memory(usize),
 }
 
+type VramRead = (ID3D12Resource, u64, usize, u64);
+type VramProbe = Box<dyn Fn(&mut Vec<VramRead>) + Send>;
+
+/// Bytes of the ring copies in video memory are brought up to date from,
+/// in a submission's list before its own ([`Host::vram_before`]).
+const UPLOAD_RING: u64 = 64 << 20;
+
+/// Bytes of the ring what shaders wrote of copies in video memory is read
+/// back into, in a submission's list after its own ([`Host::vram_after`]).
+const READBACK_RING: u64 = 32 << 20;
+
+/// How many of `lens` (in order) fit in a ring of `max` bytes at 16-byte
+/// offsets, and the bytes they take.
+fn staged(lens: impl IntoIterator<Item = u64>, max: u64) -> (usize, u64) {
+    let (mut n, mut at) = (0, 0u64);
+    for len in lens {
+        let end = at + len;
+        if end > max {
+            break;
+        }
+        at = end.next_multiple_of(16);
+        n += 1;
+    }
+    (n, at)
+}
+
 /// What a list does on the CPU when it is submitted: copies between host
 /// memory regions (title buffers, upload buffers and buffer copies), and
 /// the upload buffers its GPU commands read, kept until the list is reset.
@@ -1057,6 +1083,17 @@ struct Deferred {
     /// shaders read title memory with no copy (`crate::memory`); then what
     /// they wrote through views does not go back either.
     missed: Vec<Box<dyn Fn() -> bool + Send>>,
+    /// Per-list VRAM/RAM dirty bitmaps (`crate::memory::bind`) to zero before
+    /// execution and read back after.
+    vram_bitmaps: Vec<(ID3D12Resource, ID3D12Resource)>,
+    /// Probes run after bitmap readbacks to collect any VRAM-backed `memory`
+    /// shadow pages that need CPU readback before `after` callbacks run.
+    vram_probes: Vec<VramProbe>,
+}
+
+#[cfg(test)]
+thread_local! {
+    static TEST_IN_EXECUTE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 impl Host {
@@ -1224,7 +1261,19 @@ impl Host {
     pub(crate) fn execute(&self, runs: &[&HostList]) {
         // One submission at a time from preparation to copy-back: snapshots
         // and the ranges shaders write are per host copy, not per submission.
+        #[cfg(test)]
+        let _bitmap_lock = crate::shadow::lock_test_bitmaps();
         let mut submitted = self.submitted.lock().unwrap_or_else(|e| e.into_inner());
+        #[cfg(test)]
+        struct InExecute(bool);
+        #[cfg(test)]
+        impl Drop for InExecute {
+            fn drop(&mut self) {
+                TEST_IN_EXECUTE.with(|f| f.set(self.0));
+            }
+        }
+        #[cfg(test)]
+        let _in_execute = InExecute(TEST_IN_EXECUTE.with(|f| f.replace(true)));
         let started = std::time::Instant::now();
         #[cfg(feature = "diagnostics")]
         let faults = crate::copystat::page_faults();
@@ -1317,6 +1366,24 @@ impl Host {
             lists.push(list.list.cast().ok());
         }
         batch.flush();
+        let vram_uploads = crate::shadow::take_vram_uploads();
+        let mut vram_bitmaps: Vec<(ID3D12Resource, ID3D12Resource)> = Vec::new();
+        let mut seen_bitmaps = std::collections::HashSet::new();
+        for list in runs {
+            for (vram, ram) in &list.deferred().vram_bitmaps {
+                use windows::core::Interface;
+                if seen_bitmaps.insert(vram.as_raw() as usize) {
+                    vram_bitmaps.push((vram.clone(), ram.clone()));
+                }
+            }
+        }
+        // Copies in video memory: brought up to date by a list run in the
+        // submission before its own, read back by one run after them, before
+        // its fence value, so that the one wait for the submission covers
+        // them too.
+        let before = self.vram_before(&vram_uploads, &vram_bitmaps);
+        let (mut ring_reads, mut later) = (Vec::new(), Vec::new());
+        let after = self.vram_after(runs, &vram_bitmaps, &mut ring_reads, &mut later);
         let prepared = std::time::Instant::now();
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::FaultsPrep, crate::copystat::page_faults().saturating_sub(faults));
@@ -1341,7 +1408,13 @@ impl Host {
             crate::resource::life::note(0, crate::resource::life::SUBMITTED, *submitted, 0);
             // SAFETY: closed lists; the fence and event are ours.
             unsafe {
+                if i == 0 && before.is_some() {
+                    self.queue.ExecuteCommandLists(std::slice::from_ref(&before));
+                }
                 self.queue.ExecuteCommandLists(group);
+                if i + 1 == groups.len() && after.is_some() {
+                    self.queue.ExecuteCommandLists(std::slice::from_ref(&after));
+                }
                 let waited = self
                     .queue
                     .Signal(&self.fence, *submitted)
@@ -1389,6 +1462,8 @@ impl Host {
                 .collect();
             tracing::warn!(ms = gpu.as_millis(), lists = runs.len(), ?pipelines, "slow host submission");
         }
+        // Check device removal before VRAM readback so DRED / removal diagnostics
+        // are reported instead of panicking inside `run_copy_list` reset.
         // SAFETY: a plain query.
         if unsafe { self.device.GetDeviceRemovedReason() }.is_err() {
             fail(format_args!(
@@ -1399,6 +1474,7 @@ impl Host {
                 removed_during(runs, removed_in)
             ));
         }
+        self.vram_ran(&ring_reads, later, runs);
         // What shaders wrote goes back before the bottom-of-pipe writes,
         // which tell the title the GPU is done; each range once per
         // submission, however many dispatches declared it (the world's
@@ -2200,6 +2276,21 @@ impl HostList {
         self.deferred().after.push(Box::new(work));
     }
 
+    /// Registers a per-list VRAM/RAM dirty bitmap pair to zero before
+    /// execution and read back afterward.
+    pub(crate) fn defer_vram_bitmap(&self, vram: ID3D12Resource, ram: ID3D12Resource) {
+        self.deferred().vram_bitmaps.push((vram, ram));
+    }
+
+    /// Registers a probe run after bitmap readbacks to collect VRAM-backed
+    /// shadow pages written through the title-memory page table.
+    pub(crate) fn defer_vram_probe(
+        &self,
+        probe: impl Fn(&mut Vec<(ID3D12Resource, u64, usize, u64)>) + Send + 'static,
+    ) {
+        self.deferred().vram_probes.push(Box::new(probe));
+    }
+
     /// Stores `what` (`bytes` of it) at `dst` once the list has run.
     pub(crate) fn defer_write(&self, dst: *mut u8, what: crate::queue::Written, bytes: usize) {
         self.deferred().writes.push((dst as usize, what, bytes));
@@ -2757,9 +2848,62 @@ mod title_copies {
 }
 
 impl Host {
+    /// Whether the host adapter uses unified memory architecture (APUs, WARP).
+    pub(crate) fn is_uma(&self) -> bool {
+        static UMA: OnceLock<bool> = OnceLock::new();
+        *UMA.get_or_init(|| {
+            let mut arch = D3D12_FEATURE_DATA_ARCHITECTURE::default();
+            // SAFETY: valid D3D12 feature query.
+            unsafe {
+                self.device.CheckFeatureSupport(
+                    D3D12_FEATURE_ARCHITECTURE,
+                    (&raw mut arch).cast(),
+                    size_of_val(&arch) as u32,
+                )
+            }
+            .is_ok()
+                && arch.UMA.as_bool()
+        })
+    }
+
+    /// Safe VRAM budget (bytes) for hot shadow buffers on discrete GPUs.
+    pub(crate) fn vram_shadow_budget(&self) -> u64 {
+        if self.is_uma() {
+            return 0;
+        }
+        static BUDGET: OnceLock<u64> = OnceLock::new();
+        *BUDGET.get_or_init(|| {
+            let Some([local, _]) = video_memory() else {
+                return 0;
+            };
+            // Cap at 25% of local DXGI budget (~2.5-3.0 GB on a 12 GB card) so
+            // streaming textures never get evicted.
+            ((local.1 * 1_000_000.0) as u64) / 4
+        })
+    }
+
     /// A buffer in the upload heap, mapped for writing.
     /// A GPU-only buffer of `size` bytes in the copy-destination state.
     pub(crate) fn default_buffer(&self, size: u64) -> Option<ID3D12Resource> {
+        self.default_buffer_with(size, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_COPY_DEST)
+    }
+
+    /// A GPU-only buffer of `size` bytes with unordered-access support in the
+    /// common state (promotes implicitly to SRV/CBV/UAV/copy/indirect).
+    pub(crate) fn default_uav_buffer(&self, size: u64) -> Option<ID3D12Resource> {
+        self.default_buffer_with(
+            size,
+            D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+            D3D12_RESOURCE_STATE_COMMON,
+        )
+    }
+
+    fn default_buffer_with(
+        &self,
+        size: u64,
+        flags: D3D12_RESOURCE_FLAGS,
+        state: D3D12_RESOURCE_STATES,
+    ) -> Option<ID3D12Resource> {
         let heap = D3D12_HEAP_PROPERTIES {
             Type: D3D12_HEAP_TYPE_DEFAULT,
             ..Default::default()
@@ -2772,6 +2916,7 @@ impl Host {
             MipLevels: 1,
             SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
             Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+            Flags: flags,
             ..Default::default()
         };
         let mut buffer: Option<ID3D12Resource> = None;
@@ -2781,12 +2926,377 @@ impl Host {
                 &heap,
                 D3D12_HEAP_FLAG_NONE,
                 &desc,
-                D3D12_RESOURCE_STATE_COPY_DEST,
+                state,
                 None,
                 &mut buffer,
             )
         };
         made.ok().and(buffer)
+    }
+
+    /// The reusable 64 MiB upload ring copies in video memory are brought up
+    /// to date from: free whenever a submission is prepared (each is waited
+    /// for before the next).
+    fn upload_ring(&self) -> (ID3D12Resource, *mut u8) {
+        static RING: Mutex<Option<(ID3D12Resource, usize)>> = Mutex::new(None);
+        let mut guard = RING.lock().unwrap_or_else(|e| e.into_inner());
+        let (buf, ptr) = guard.get_or_insert_with(|| {
+            let (b, p) = self.upload_buffer(UPLOAD_RING).expect("vram upload ring");
+            (b, p as usize)
+        });
+        (buf.clone(), *ptr as *mut u8)
+    }
+
+    /// The reusable 32 MiB readback ring, as [`Host::upload_ring`].
+    fn readback_ring(&self) -> (ID3D12Resource, *mut u8) {
+        static RING: Mutex<Option<(ID3D12Resource, usize)>> = Mutex::new(None);
+        let mut guard = RING.lock().unwrap_or_else(|e| e.into_inner());
+        let (buf, ptr) = guard.get_or_insert_with(|| {
+            let (b, p) = self.mapped_buffer(READBACK_RING, true).expect("vram readback ring");
+            (b, p as usize)
+        });
+        (buf.clone(), *ptr as *mut u8)
+    }
+
+    /// Streams CPU shadow ranges into VRAM through the upload ring, waited
+    /// for: a submission's uploads past the ring (they go before its own,
+    /// [`Host::vram_before`]), and tests.
+    fn upload_vram_copies(&self, uploads: &[crate::shadow::VramCopy]) {
+        if uploads.is_empty() {
+            return;
+        }
+        let (ring_buf, ring_ptr) = self.upload_ring();
+        let mut offset = 0u64;
+        let mut batch: Vec<(ID3D12Resource, u64, u64, u64)> = Vec::new();
+        let flush = |batch: &mut Vec<(ID3D12Resource, u64, u64, u64)>| {
+            if batch.is_empty() {
+                return;
+            }
+            self.run_copy_list(
+                |list| {
+                    for (dst, dst_off, src_off, len) in batch.iter() {
+                        // SAFETY: valid upload ring and destination VRAM buffer regions.
+                        unsafe { list.CopyBufferRegion(dst, *dst_off, &ring_buf, *src_off, *len) };
+                    }
+                },
+                true,
+            );
+            batch.clear();
+        };
+
+        for u in uploads {
+            let mut done = 0u64;
+            while done < u.len {
+                let mut avail = UPLOAD_RING - offset;
+                if avail == 0 {
+                    flush(&mut batch);
+                    offset = 0;
+                    avail = UPLOAD_RING;
+                }
+                let chunk = (u.len - done).min(avail);
+                // SAFETY: `u.src_ptr + done` is kept live by `u._cpu` and `ring_ptr + offset` is mapped.
+                unsafe {
+                    std::ptr::copy_nonoverlapping(
+                        (u.src_ptr as *const u8).add(done as usize),
+                        ring_ptr.add(offset as usize),
+                        chunk as usize,
+                    );
+                }
+                batch.push((u.dst.clone(), u.dst_off + done, offset, chunk));
+                offset = (offset + chunk).next_multiple_of(16).min(UPLOAD_RING);
+                done += chunk;
+            }
+        }
+        flush(&mut batch);
+    }
+
+    /// Copies GPU-written VRAM ranges back to their CPU mirrors through the
+    /// readback ring, waited for: once a submission has run, the ranges only
+    /// its bitmaps name and those past the ring ([`Host::vram_ran`]).
+    fn readback_vram_copies(&self, reads: &[VramRead]) {
+        if reads.is_empty() {
+            return;
+        }
+        let (ring_buf, ring_ptr) = self.readback_ring();
+        let mut offset = 0u64;
+        let mut batch: Vec<(ID3D12Resource, u64, u64, usize, u64)> = Vec::new();
+        let flush = |batch: &mut Vec<(ID3D12Resource, u64, u64, usize, u64)>| {
+            if batch.is_empty() {
+                return;
+            }
+            self.run_copy_list(
+                |list| {
+                    for (src, src_off, dst_off, _, len) in batch.iter() {
+                        // SAFETY: valid VRAM buffer and readback ring regions.
+                        unsafe { list.CopyBufferRegion(&ring_buf, *dst_off, src, *src_off, *len) };
+                    }
+                },
+                true,
+            );
+            for (_, _, ring_off, cpu_ptr, len) in batch.drain(..) {
+                // SAFETY: GPU finished writing `ring_buf`; `cpu_ptr` is valid for `len` bytes.
+                unsafe {
+                    std::ptr::copy_nonoverlapping(
+                        ring_ptr.add(ring_off as usize),
+                        cpu_ptr as *mut u8,
+                        len as usize,
+                    );
+                }
+            }
+        };
+
+        for (src, src_off, cpu_ptr, total_len) in reads {
+            let mut done = 0u64;
+            while done < *total_len {
+                let mut avail = READBACK_RING - offset;
+                if avail == 0 {
+                    flush(&mut batch);
+                    offset = 0;
+                    avail = READBACK_RING;
+                }
+                let chunk = (*total_len - done).min(avail);
+                batch.push((src.clone(), *src_off + done, offset, *cpu_ptr + done as usize, chunk));
+                offset = (offset + chunk).next_multiple_of(16).min(READBACK_RING);
+                done += chunk;
+            }
+        }
+        flush(&mut batch);
+    }
+
+    /// One of the two lists of ours run around a submission's own (`after`:
+    /// the one after), open: each submission is waited for before the next
+    /// is prepared, so they are free to reset.
+    fn around_list(&self, after: bool) -> ID3D12GraphicsCommandList {
+        type Around = Option<(ID3D12CommandAllocator, ID3D12GraphicsCommandList)>;
+        static LISTS: Mutex<[Around; 2]> = Mutex::new([None, None]);
+        let mut lists = LISTS.lock().unwrap_or_else(|e| e.into_inner());
+        // SAFETY: plain creation; the last submission that ran the list has
+        // completed, so its allocator and the list are free to reset.
+        unsafe {
+            let (alloc, list) = lists[usize::from(after)].get_or_insert_with(|| {
+                let alloc: ID3D12CommandAllocator = self
+                    .device
+                    .CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT)
+                    .expect("a copy allocator");
+                let list: ID3D12GraphicsCommandList = self
+                    .device
+                    .CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &alloc, None)
+                    .expect("a copy list");
+                let _ = list.Close();
+                (alloc, list)
+            });
+            alloc.Reset().expect("reset copy allocator");
+            list.Reset(&*alloc, None).expect("reset copy list");
+            list.clone()
+        }
+    }
+
+    /// Records, closed, the list run in the submission before its own lists:
+    /// copies in video memory brought up to date from their mirrors through
+    /// the upload ring, page tables, the lists' page bitmaps zeroed and the
+    /// views' bitmaps as the CPU left them. Uploads past the ring go first,
+    /// waited for (a burst: copies made in video memory are filled whole).
+    fn vram_before(
+        &self,
+        uploads: &[crate::shadow::VramCopy],
+        bitmaps: &[(ID3D12Resource, ID3D12Resource)],
+    ) -> Option<ID3D12CommandList> {
+        if uploads.is_empty() && !crate::memory::needs_vram_pre(bitmaps) && !crate::shadow::has_vram_bitmaps() {
+            return None;
+        }
+        let (n, _) = staged(uploads.iter().map(|u| u.len), UPLOAD_RING);
+        self.upload_vram_copies(&uploads[n..]);
+        let (ring, ring_ptr) = self.upload_ring();
+        let list = self.around_list(false);
+        let mut at = 0u64;
+        for u in &uploads[..n] {
+            // SAFETY: `u.src_ptr` is live for `u.len` bytes (held by
+            // `u._cpu`), the ring mapped for `at + u.len`; the GPU reads it
+            // once the submission runs, before the next one is prepared.
+            unsafe {
+                std::ptr::copy_nonoverlapping(u.src_ptr as *const u8, ring_ptr.add(at as usize), u.len as usize);
+                list.CopyBufferRegion(&u.dst, u.dst_off, &ring, at, u.len);
+            }
+            at = (at + u.len).next_multiple_of(16);
+        }
+        crate::memory::sync_vram_pre(&list, bitmaps);
+        crate::shadow::sync_bitmaps_pre(&list);
+        // SAFETY: our open list.
+        unsafe { list.Close() }.expect("close copy list");
+        list.cast().ok()
+    }
+
+    /// Records, closed, the list run in the submission after its own lists,
+    /// before its fence value: what shaders wrote of copies in video memory
+    /// (declared ranges) into the readback ring (`ring_reads`: offset,
+    /// mirror, bytes, taken by [`Host::vram_ran`]), the lists' page bitmaps
+    /// and the views' bitmaps into system memory. Ranges past the ring go
+    /// to `later`.
+    fn vram_after(
+        &self,
+        runs: &[&HostList],
+        bitmaps: &[(ID3D12Resource, ID3D12Resource)],
+        ring_reads: &mut Vec<(u64, usize, u64)>,
+        later: &mut Vec<VramRead>,
+    ) -> Option<ID3D12CommandList> {
+        let mut seen = std::collections::HashSet::new();
+        let mut reads: Vec<VramRead> = Vec::new();
+        for list in runs {
+            for step in &list.deferred().copies {
+                // Marked ranges of tracked copies keep no snapshot
+                // (`Shadow::writing`): they go back by their marks, whose
+                // pages `vram_ran` reads back.
+                if let Step::GpuWrite(shadow, address, len, false, _) = step
+                    && seen.insert((std::sync::Arc::as_ptr(shadow) as usize, *address, *len))
+                    && let Some((cpu_ptr, base, start, buf_len)) = shadow.vram_readback()
+                {
+                    let s = (*address as u64).max(start);
+                    let e = ((*address + *len) as u64).min(start + buf_len);
+                    if e > s {
+                        let off_in_shadow = s - start;
+                        reads.push((shadow.buffer.clone(), base + off_in_shadow, cpu_ptr + off_in_shadow as usize, e - s));
+                    }
+                }
+            }
+        }
+        if reads.is_empty() && bitmaps.is_empty() && !crate::shadow::has_vram_bitmaps() {
+            return None;
+        }
+        let (n, _) = staged(reads.iter().map(|r| r.3), READBACK_RING);
+        later.extend(reads.drain(n..));
+        let (ring, _) = self.readback_ring();
+        let list = self.around_list(true);
+        let mut at = 0u64;
+        for (src, src_off, cpu_ptr, len) in &reads {
+            // SAFETY: our open list; live buffers, `at + len` inside the ring.
+            unsafe { list.CopyBufferRegion(&ring, at, src, *src_off, *len) };
+            ring_reads.push((at, *cpu_ptr, *len));
+            at = (at + len).next_multiple_of(16);
+        }
+        crate::memory::sync_vram_post(&list, bitmaps);
+        crate::shadow::sync_bitmaps_post(&list);
+        // SAFETY: our open list.
+        unsafe { list.Close() }.expect("close copy list");
+        list.cast().ok()
+    }
+
+    /// Once the submission has run: what the list after it read back goes
+    /// into the copies' mirrors, then the pages only the bitmaps name (the
+    /// views' written pages, those the lists' page bitmaps name) and ranges
+    /// past the ring are read back, waited for.
+    fn vram_ran(&self, ring_reads: &[(u64, usize, u64)], mut later: Vec<VramRead>, runs: &[&HostList]) {
+        if !ring_reads.is_empty() {
+            let (_, ring_ptr) = self.readback_ring();
+            for &(at, cpu_ptr, len) in ring_reads {
+                // SAFETY: the submission has run: the ring holds the bytes; the
+                // mirror lives while the lists that declared the range do.
+                unsafe { std::ptr::copy_nonoverlapping(ring_ptr.add(at as usize), cpu_ptr as *mut u8, len as usize) };
+            }
+        }
+        later.extend(crate::shadow::vram_marked_reads());
+        for list in runs {
+            for probe in &list.deferred().vram_probes {
+                probe(&mut later);
+            }
+        }
+        self.readback_vram_copies(&later);
+    }
+
+    #[cfg(test)]
+    fn run_test_copy_sync<F: FnOnce(&ID3D12GraphicsCommandList)>(&self, record: F) {
+        self.run_copy_list(record, true);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_upload_buffer(&self, dst: &ID3D12Resource, dst_off: u64, src: *const u8, len: u64) {
+        let Some((up, ptr)) = self.upload_buffer(len.max(1)) else { return };
+        // SAFETY: `src` is valid for `len` bytes and `ptr` is mapped.
+        unsafe { std::ptr::copy_nonoverlapping(src, ptr, len as usize) };
+        self.run_test_copy_sync(|list| {
+            // SAFETY: valid test buffer regions.
+            unsafe { list.CopyBufferRegion(dst, dst_off, &up, 0, len) };
+        });
+    }
+
+    #[cfg(test)]
+    pub(crate) fn flush_test_vram_uploads(&self) {
+        if TEST_IN_EXECUTE.with(|f| f.get()) {
+            // Already inside `Host::execute` on this thread holding `self.submitted`;
+            // it will drain and upload `VRAM_UPLOADS` before executing the lists.
+            return;
+        }
+        // Held so the ring is not written while a submission uses it.
+        let _submitted = self.submitted.lock().unwrap_or_else(|e| e.into_inner());
+        let uploads = crate::shadow::take_vram_uploads();
+        if !uploads.is_empty() {
+            self.upload_vram_copies(&uploads);
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_readback_buffer(&self, src: &ID3D12Resource, src_off: u64, dst: *mut u8, len: u64) {
+        let Some((rb, ptr)) = self.mapped_buffer(len.max(1), true) else { return };
+        self.run_test_copy_sync(|list| {
+            // SAFETY: valid test buffer regions.
+            unsafe { list.CopyBufferRegion(&rb, 0, src, src_off, len) };
+        });
+        // SAFETY: GPU copy finished before fence wait returned.
+        unsafe { std::ptr::copy_nonoverlapping(ptr, dst, len as usize) };
+    }
+
+    fn run_copy_list<F: FnOnce(&ID3D12GraphicsCommandList)>(&self, record: F, wait: bool) {
+        struct CopyEvent(HANDLE);
+        // SAFETY: Win32 event handle is only waited on while `CMD` mutex is held.
+        unsafe impl Send for CopyEvent {}
+        struct CopyCmd {
+            alloc: ID3D12CommandAllocator,
+            list: ID3D12GraphicsCommandList,
+            fence: ID3D12Fence,
+            event: CopyEvent,
+            seq: u64,
+        }
+        static CMD: Mutex<Option<CopyCmd>> = Mutex::new(None);
+        let mut guard = CMD.lock().unwrap_or_else(|e| e.into_inner());
+        let cmd = guard.get_or_insert_with(|| {
+            // SAFETY: valid D3D12 device creating a direct allocator, fence, event, and closed command list.
+            unsafe {
+                let alloc: ID3D12CommandAllocator = self
+                    .device
+                    .CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT)
+                    .unwrap();
+                let list: ID3D12GraphicsCommandList = self
+                    .device
+                    .CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &alloc, None)
+                    .unwrap();
+                let fence: ID3D12Fence = self.device.CreateFence(0, D3D12_FENCE_FLAG_NONE).unwrap();
+                let event = CopyEvent(CreateEventW(None, false, false, None).unwrap());
+                let _ = list.Close();
+                CopyCmd {
+                    alloc,
+                    list,
+                    fence,
+                    event,
+                    seq: 0,
+                }
+            }
+        });
+        // SAFETY: `alloc`, `list`, `fence`, and `event` are exclusively held under `CMD`.
+        unsafe {
+            cmd.alloc.Reset().expect("reset copy allocator");
+            cmd.list.Reset(&cmd.alloc, None).expect("reset copy list");
+            record(&cmd.list);
+            cmd.list.Close().expect("close copy list");
+            let list_cmd: Option<ID3D12CommandList> = cmd.list.cast().ok();
+            self.queue.ExecuteCommandLists(&[list_cmd]);
+            if wait {
+                cmd.seq += 1;
+                if self.queue.Signal(&cmd.fence, cmd.seq).is_ok()
+                    && cmd.fence.SetEventOnCompletion(cmd.seq, cmd.event.0).is_ok()
+                {
+                    WaitForSingleObject(cmd.event.0, INFINITE);
+                }
+            }
+        }
     }
 
     pub(crate) fn upload_buffer(&self, size: u64) -> Option<(ID3D12Resource, *mut u8)> {
@@ -4036,6 +4546,71 @@ mod batch {   // `mod tests` is already taken at the top of this file
         batch.title_written();
         batch.add(&copy, p, len);
         assert_eq!(batch.flush(), PAGE, "after a title write, what changed");
+        crate::shadow::unregister(p, p as u64);
+        drop(copy);
+        crate::watch::tests::free(p);
+    }
+}
+
+#[cfg(test)]
+mod vram_around {
+    use super::*;
+
+    /// Ranges take the ring in order, each at a 16-byte offset, while they
+    /// fit; the rest goes through the waited-for path.
+    #[test]
+    fn ranges_take_the_ring_in_order_at_16_byte_offsets() {
+        assert_eq!(staged([], 64), (0, 0));
+        assert_eq!(staged([5, 16, 3], 64), (3, 48));
+        assert_eq!(staged([40, 30], 64), (1, 48), "past the ring: left");
+        assert_eq!(staged([40, 30, 8], 64), (1, 48), "in order: none after one left");
+        assert_eq!(staged([64], 64), (1, 64));
+        assert_eq!(staged([65], 64), (0, 0));
+    }
+
+    /// What a list's own commands write into a copy in video memory goes
+    /// back to title memory once the submission has run: a range read back
+    /// by the list after the submission's, and one past the read-back ring,
+    /// read back once it has run.
+    #[test]
+    fn vram_writes_go_back_within_and_past_the_readback_ring() {
+        use crate::watch::PAGE;
+        let Some(host) = host() else {
+            return; // no host GPU here
+        };
+        let pages = (READBACK_RING as usize).div_ceil(PAGE) + 1;
+        let (p, len) = (crate::watch::tests::pool(pages), pages * PAGE);
+        let (near, far) = (p + 16, p + len - 16);
+        for at in [near, far] {
+            // SAFETY: our pool, not guarded yet.
+            unsafe { (at as *mut u32).write_volatile(0x11) };
+        }
+        crate::shadow::register(p, p as u64, len as u64);
+        let found = crate::shadow::find(p as u64, len as u64).and_then(|c| c.vram_readback().map(|v| (c, v)));
+        let Some((copy, (_, base, start, _))) = found else {
+            crate::shadow::unregister(p, p as u64);
+            crate::watch::tests::free(p);
+            return; // no copies in video memory here
+        };
+        let list = host.new_list().unwrap();
+        copy.refresh(&list, p as u64, len as u64);
+        copy.gpu_writes(&list, p as u64, PAGE as u64, false);
+        copy.gpu_writes(&list, (p + PAGE) as u64, (len - PAGE) as u64, false);
+        // The shaders' writes: copies into the copy in video memory.
+        let (up, data) = host.upload_buffer(8).expect("an upload buffer");
+        // SAFETY: a mapped upload buffer of 8 bytes; an open list, live buffers.
+        unsafe {
+            data.cast::<[u32; 2]>().write_volatile([0xcafe_f00d, 0xfeed_beef]);
+            list.list.CopyBufferRegion(&copy.buffer, base + (near as u64 - start), &up, 0, 4);
+            list.list.CopyBufferRegion(&copy.buffer, base + (far as u64 - start), &up, 4, 4);
+        }
+        list.keep(&up);
+        list.close();
+        host.execute(&[&list]);
+        // SAFETY: words of our pool.
+        let title = |at: usize| unsafe { (at as *const u32).read_volatile() };
+        assert_eq!(title(near), 0xcafe_f00d, "read back in the submission");
+        assert_eq!(title(far), 0xfeed_beef, "past the ring: read back after it");
         crate::shadow::unregister(p, p as u64);
         drop(copy);
         crate::watch::tests::free(p);

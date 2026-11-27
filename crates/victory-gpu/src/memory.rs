@@ -106,6 +106,7 @@ struct Layout {
 /// A 256 KiB dirty-page bitmap buffer kept zeroed while in [`BITMAP_POOL`].
 struct Bitmap {
     _resource: ID3D12Resource,
+    vram: Option<ID3D12Resource>,
     data: usize,
     gpu: u64,
 }
@@ -127,14 +128,17 @@ impl Bitmap {
         if let Some(bitmap) = BITMAP_POOL.lock().unwrap_or_else(|e| e.into_inner()).pop() {
             return Some(bitmap);
         }
-        let (resource, data) = crate::host::host()?.shared_buffer(BITMAP_BYTES)?;
+        let h = crate::host::host()?;
+        let (resource, data) = h.shared_buffer(BITMAP_BYTES)?;
         crate::host::name(&resource, || "title memory written pages".into());
         // SAFETY: `data` is a newly mapped shared buffer of at least `BITMAP_WORDS` dwords.
         unsafe { std::ptr::write_bytes(data.cast::<u32>(), 0, BITMAP_WORDS) };
-        // SAFETY: `resource` is a live D3D12 buffer.
-        let gpu = unsafe { resource.GetGPUVirtualAddress() };
+        let vram = (!h.is_uma()).then(|| h.default_uav_buffer(BITMAP_BYTES)).flatten();
+        // SAFETY: `resource` / `vram` is a live D3D12 buffer.
+        let gpu = unsafe { vram.as_ref().unwrap_or(&resource).GetGPUVirtualAddress() };
         Some(Self {
             _resource: resource,
+            vram,
             data: data as usize,
             gpu,
         })
@@ -198,6 +202,56 @@ impl Drop for PooledBitmap {
     }
 }
 
+fn zeros_upload() -> Option<ID3D12Resource> {
+    static ZEROS: std::sync::OnceLock<Option<ID3D12Resource>> = std::sync::OnceLock::new();
+    ZEROS
+        .get_or_init(|| {
+            let (buf, data) = crate::host::host()?.upload_buffer(BITMAP_BYTES)?;
+            // SAFETY: mapped upload buffer of `BITMAP_BYTES`.
+            unsafe { std::ptr::write_bytes(data, 0, BITMAP_BYTES as usize) };
+            Some(buf)
+        })
+        .clone()
+}
+
+pub(crate) fn needs_vram_pre(vram_bitmaps: &[(ID3D12Resource, ID3D12Resource)]) -> bool {
+    !vram_bitmaps.is_empty() || shared().iter().any(|(_, s)| s.dirty && s.vram.is_some())
+}
+
+pub(crate) fn sync_vram_pre(
+    list: &windows::Win32::Graphics::Direct3D12::ID3D12GraphicsCommandList,
+    vram_bitmaps: &[(ID3D12Resource, ID3D12Resource)],
+) {
+    let bytes = TABLE_DWORDS as u64 * 4;
+    for (_, s) in shared().iter_mut() {
+        if s.dirty {
+            s.dirty = false;
+            if let Some(vram) = &s.vram {
+                // SAFETY: live table buffers of `bytes`.
+                unsafe { list.CopyBufferRegion(vram, 0, &s.table, 0, bytes) };
+            }
+        }
+    }
+    if !vram_bitmaps.is_empty()
+        && let Some(zeros) = zeros_upload()
+    {
+        for (vram, _) in vram_bitmaps {
+            // SAFETY: live buffers of `BITMAP_BYTES`.
+            unsafe { list.CopyBufferRegion(vram, 0, &zeros, 0, BITMAP_BYTES) };
+        }
+    }
+}
+
+pub(crate) fn sync_vram_post(
+    list: &windows::Win32::Graphics::Direct3D12::ID3D12GraphicsCommandList,
+    vram_bitmaps: &[(ID3D12Resource, ID3D12Resource)],
+) {
+    for (vram, ram) in vram_bitmaps {
+        // SAFETY: live buffers of `BITMAP_BYTES`.
+        unsafe { list.CopyBufferRegion(ram, 0, vram, 0, BITMAP_BYTES) };
+    }
+}
+
 /// A view heap's page table, shared by every list using title memory with
 /// the heap bound, and the view pairs of the copies it names.
 struct Shared {
@@ -205,6 +259,8 @@ struct Shared {
     /// address is another).
     host: usize,
     table: ID3D12Resource,
+    vram: Option<ID3D12Resource>,
+    dirty: bool,
     data: usize,
     gpu: u64,
     /// The pair of null views entries without a copy name.
@@ -481,15 +537,19 @@ impl Shared {
     /// submission that uses it).
     fn new(heap: &HostHeap) -> Option<Shared> {
         let bytes = TABLE_DWORDS as u64 * 4;
-        let (table, data) = crate::host::host()?.upload_buffer(bytes)?;
+        let h = crate::host::host()?;
+        let (table, data) = h.upload_buffer(bytes)?;
         crate::host::name(&table, || "title memory page table".into());
         let null = heap.pair()?;
         heap.raw_pair_at(null, None, 0);
+        let vram = (!h.is_uma()).then(|| h.default_uav_buffer(bytes)).flatten();
         // SAFETY: a live buffer.
-        let gpu = unsafe { table.GetGPUVirtualAddress() };
+        let gpu = unsafe { vram.as_ref().unwrap_or(&table).GetGPUVirtualAddress() };
         Some(Shared {
             host: std::ptr::from_ref(heap) as usize,
             table,
+            vram,
+            dirty: false,
             data: data as usize,
             gpu,
             null,
@@ -504,6 +564,7 @@ impl Shared {
     /// back, the table rewritten. Only while no submission runs (the GPU
     /// reads the table and the views).
     fn rewrite(&mut self, heap: &HostHeap, now: u64) {
+        self.dirty = true;
         let copies = crate::shadow::all();
         let live: HashSet<usize> = copies.iter().map(|c| Arc::as_ptr(c) as usize).collect();
         self.pairs.retain(|copy, &mut slot| {
@@ -616,13 +677,13 @@ pub(crate) fn bind(list: &HostList, key: usize) -> Option<Map> {
         let mut shared = shared();
         let host = std::ptr::from_ref(heap) as usize;
         if let Some((_, s)) = shared.iter().find(|(k, s)| *k == key && s.host == host) {
-            list.keep(&s.table);
+            list.keep(s.vram.as_ref().unwrap_or(&s.table));
             return Some(s.gpu);
         }
         // A released heap's table goes with it (lists that name it hold it).
         shared.retain(|(k, _)| *k != key);
         let s = Shared::new(heap)?;
-        list.keep(&s.table);
+        list.keep(s.vram.as_ref().unwrap_or(&s.table));
         let gpu = s.gpu;
         shared.push((key, s));
         Some(gpu)
@@ -630,9 +691,56 @@ pub(crate) fn bind(list: &HostList, key: usize) -> Option<Map> {
     .flatten()?;
     let pooled = Arc::new(PooledBitmap::new(Bitmap::acquire()?));
     let dirty = pooled.gpu();
+    if let Some(bm) = &pooled.bitmap
+        && let Some(vram) = &bm.vram
+    {
+        list.keep(vram);
+        list.defer_vram_bitmap(vram.clone(), bm._resource.clone());
+    }
     list.defer_memory(key);
     let precise: Arc<Mutex<Vec<(u64, u64)>>> = Arc::default();
     let byte_for_byte = precise.clone();
+    let probe_bitmap = Arc::clone(&pooled);
+    let probe_precise = Arc::clone(&precise);
+    list.defer_vram_probe(move |reads| {
+        let Layout { copies, blocks, owner, .. } = &*layout(key);
+        let precise = probe_precise.lock().unwrap_or_else(|e| e.into_inner());
+        // SAFETY: the bitmap is mapped and its readback finished.
+        let marks =
+            unsafe { std::slice::from_raw_parts(probe_bitmap.data() as *const u32, BITMAP_WORDS) };
+        for (w, &mark) in marks.iter().enumerate() {
+            if mark == 0 {
+                continue;
+            }
+            let mut bits = mark;
+            while bits != 0 {
+                let entry = w * 32 + bits.trailing_zeros() as usize;
+                bits &= bits - 1;
+                let (block, page) = (entry / BLOCK, entry % BLOCK);
+                let Some(&l1) = blocks.get(block).filter(|_| block != 0) else {
+                    continue;
+                };
+                let at = (l1 << 28 | page << 16) as u64;
+                if let Some(&k) = owner.get(entry)
+                    && k != NO_OWNER
+                    && !precise.iter().any(|&(a, n)| a < at + (1 << 16) && at < a + n)
+                    && let Some((cpu_ptr, vram_base, start, buf_len)) = copies[k as usize].vram_readback()
+                {
+                    let s = at.max(start);
+                    let e = (at + (1 << 16)).min(start + buf_len);
+                    if e > s {
+                        let off = s - start;
+                        reads.push((
+                            copies[k as usize].buffer.clone(),
+                            vram_base + off,
+                            cpu_ptr + off as usize,
+                            e - s,
+                        ));
+                    }
+                }
+            }
+        }
+    });
     let missed_bitmap = Arc::clone(&pooled);
     list.defer_missed(move || {
         let l = layout(key);
@@ -1159,5 +1267,105 @@ void main() {
         }
         crate::shadow::unregister(p, p as u64);
         drop(copy);
+    }
+
+    /// Two command lists recorded with `memory::bind` and executed in separate
+    /// submissions keep their own dirty bitmaps instead of draining each other.
+    #[test]
+    fn separate_memory_bind_submissions_keep_their_own_bitmaps() {
+        let _guard = gpu_test_lock();
+        use crate::watch::PAGE;
+        use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc};
+        let (Some(host), Some(views)) = (crate::host::host(), heap()) else {
+            return; // no host GPU here
+        };
+        let (write_root, writer) = pipeline(WRITE);
+        let p = (0..256u64)
+            .map(|k| 0x50_0000_0000 + (k << 28))
+            // SAFETY: a fresh allocation where nothing is mapped, or none.
+            .map(|hint| unsafe { VirtualAlloc(hint as *const _, PAGE, MEM_RESERVE | MEM_COMMIT | crate::watch::tests::MEM_WRITE_WATCH, PAGE_READWRITE) } as usize)
+            .find(|&p| p != 0)
+            .expect("memory below 2^40");
+        let at = p + 16;
+        crate::shadow::register(p, p as u64, PAGE as u64);
+        let _copy = crate::shadow::find(p as u64, PAGE as u64).unwrap();
+        let l1 = host.new_list().unwrap();
+        let l2 = host.new_list().unwrap();
+        let map1 = bind(&l1, OURS).expect("l1 page table");
+        let map2 = bind(&l2, OURS).expect("l2 page table");
+
+        // Record L1 with no missed region, and L2 with an unmapped region-1 miss.
+        let c1 = [at as u32, (at >> 32) as u32, 0x22, 0, 0];
+        let missing: u64 = 0xff_f000_0000;
+        let c2 = [at as u32, (at >> 32) as u32, 0x33, missing as u32, (missing >> 32) as u32];
+        // SAFETY: open lists with live test pipeline and heaps.
+        unsafe {
+            for (l, map, c) in [(&l1, &map1, &c1), (&l2, &map2, &c2)] {
+                l.list.SetDescriptorHeaps(&[Some(views.heap.clone())]);
+                l.list.SetComputeRootSignature(&write_root);
+                l.list.SetComputeRootDescriptorTable(0, views.gpu(0));
+                l.list.SetComputeRootShaderResourceView(1, map.table);
+                l.list.SetComputeRootUnorderedAccessView(2, map.dirty);
+                l.list.SetComputeRoot32BitConstants(3, c.len() as u32, c.as_ptr().cast(), 0);
+                l.list.SetPipelineState(&writer);
+                l.list.Dispatch(1, 1, 1);
+                l.close();
+            }
+        }
+        let before = stats(|s| s.missed_regions);
+        host.execute(&[&l1]);
+        let after_l1 = stats(|s| s.missed_regions);
+        host.execute(&[&l2]);
+        let after_l2 = stats(|s| s.missed_regions);
+        assert_eq!(after_l1, before, "L1 must not report L2's miss");
+        assert_eq!(after_l2, before + 1, "L2 must keep its own bitmap across L1's execute");
+        crate::shadow::unregister(p, p as u64);
+    }
+
+    /// A shader write through the title-memory page table into a VRAM-backed
+    /// shadow (without `Step::GpuWrite`) still reaches title memory.
+    #[test]
+    fn vram_page_table_writes_go_back_to_title() {
+        let _guard = gpu_test_lock();
+        use crate::watch::PAGE;
+        use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc};
+        let (Some(host), Some(views)) = (crate::host::host(), heap()) else {
+            return; // no host GPU here
+        };
+        let (write_root, writer) = pipeline(WRITE);
+        let p = (0..256u64)
+            .map(|k| 0x50_0000_0000 + (k << 28))
+            // SAFETY: a fresh allocation where nothing is mapped, or none.
+            .map(|hint| unsafe { VirtualAlloc(hint as *const _, PAGE, MEM_RESERVE | MEM_COMMIT | crate::watch::tests::MEM_WRITE_WATCH, PAGE_READWRITE) } as usize)
+            .find(|&p| p != 0)
+            .expect("memory below 2^40");
+        let at = p + 16;
+        // SAFETY: our pool, not guarded yet.
+        unsafe { (at as *mut u32).write_volatile(0x11) };
+        crate::shadow::register(p, p as u64, PAGE as u64);
+        let _copy = crate::shadow::find(p as u64, PAGE as u64).unwrap();
+        // Ensure any prior test's miss withholding is cleared for this frame.
+        FRAMES.fetch_add(2, std::sync::atomic::Ordering::Relaxed);
+        note_submission(false);
+        let list = host.new_list().unwrap();
+        let map = bind(&list, OURS).expect("a page table");
+        let constants = [at as u32, (at >> 32) as u32, 0xcafe_f00d, 0, 0];
+        // SAFETY: open list with live test pipeline and heaps.
+        unsafe {
+            list.list.SetDescriptorHeaps(&[Some(views.heap.clone())]);
+            list.list.SetComputeRootSignature(&write_root);
+            list.list.SetComputeRootDescriptorTable(0, views.gpu(0));
+            list.list.SetComputeRootShaderResourceView(1, map.table);
+            list.list.SetComputeRootUnorderedAccessView(2, map.dirty);
+            list.list.SetComputeRoot32BitConstants(3, constants.len() as u32, constants.as_ptr().cast(), 0);
+            list.list.SetPipelineState(&writer);
+            list.list.Dispatch(1, 1, 1);
+        }
+        list.close();
+        host.execute(&[&list]);
+        // SAFETY: our pool.
+        let title_word = unsafe { (at as *const u32).read_volatile() };
+        assert_eq!(title_word, 0xcafe_f00d);
+        crate::shadow::unregister(p, p as u64);
     }
 }
