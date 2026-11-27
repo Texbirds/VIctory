@@ -39,6 +39,7 @@ enum Job {
 
 pub fn run(paths: &[PathBuf], threads: usize) -> Result<()> {
     let started = Instant::now();
+    let keys_only = keys_output_path(std::env::var_os("VICTORY_PREBUILD_KEYS"))?;
     pipeline::use_pipeline_cache(victory_core::Config::load()?.cache_subdir("pipelines")?);
     // The files that hold shaders (or the pack itself).
     let files: Vec<(PathBuf, Vec<u8>)> = paths
@@ -247,7 +248,6 @@ pub fn run(paths: &[PathBuf], threads: usize) -> Result<()> {
     // record's key (what a run lists pipelines by) with its shaders and
     // state as a run's `VICTORY_PIPELINE_LOG` has them, or why it is
     // skipped; and the records each source named states for.
-    let keys_only = std::env::var_os("VICTORY_PREBUILD_KEYS");
     if keys_only.is_some() {
         let mut by: BTreeMap<(&str, &str), usize> = BTreeMap::new();
         for g in &graphics {
@@ -364,6 +364,39 @@ fn program_ids(bytes: &[u8]) -> Vec<([u8; 24], HwStage)> {
         .unwrap_or_default()
 }
 
+fn keys_output_path(value: Option<std::ffi::OsString>) -> Result<Option<PathBuf>> {
+    let Some(file) = value else {
+        return Ok(None);
+    };
+    let path = PathBuf::from(file);
+    victory_core::ensure_outside_repo(&path)?;
+    Ok(Some(path))
+}
+
 fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::ffi::OsString;
+
+    #[test]
+    fn prebuild_keys_inside_repo_is_refused() {
+        assert_eq!(keys_output_path(None).unwrap(), None);
+
+        let inside = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("keys.txt");
+        let err = keys_output_path(Some(OsString::from(&inside))).unwrap_err();
+        assert!(
+            err.to_string().contains("inside the VIctory source tree"),
+            "unexpected error: {err}"
+        );
+
+        let outside = std::env::temp_dir().join("victory-prebuild-keys-test.txt");
+        assert_eq!(
+            keys_output_path(Some(OsString::from(&outside))).unwrap(),
+            Some(outside)
+        );
+    }
 }
