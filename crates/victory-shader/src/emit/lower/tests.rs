@@ -4,6 +4,8 @@ use crate::native::{
 };
 use crate::{io, ir, resource, structure};
 
+mod size_handles;
+
 pub(super) const S_ENDPGM: u32 = 0xBF81_0000;
 
 /// A program's constant table starts after its instructions, unless a
