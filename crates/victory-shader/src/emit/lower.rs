@@ -33,6 +33,8 @@ mod image_store_tests;
 #[cfg(test)]
 pub(crate) use marks::per_lane_marks;
 
+mod half_round;
+
 type Why = &'static str;
 type HandleProps = (u32, u32);
 
@@ -2953,11 +2955,7 @@ impl<'a> Lower<'a> {
         let m = &mut self.s.m;
         let product = m.bin(c, Bin::Mul, a, b);
         let sum = m.bin(c, Bin::Add, product, addend);
-        let addend_hi = m.bin(c, Bin::Sub, sum, product);
-        let product_hi = m.bin(c, Bin::Sub, sum, addend_hi);
-        let product_lo = m.bin(c, Bin::Sub, product, product_hi);
-        let addend_lo = m.bin(c, Bin::Sub, addend, addend_hi);
-        let error = m.bin(c, Bin::Add, product_lo, addend_lo);
+        let error = self.f32_sum_error(product, addend, sum);
         // Saturation only changes the sum to an endpoint, neither a midpoint.
         let sum = if clamp { self.unary(7, sum) } else { sum };
         let bits = self.as_int(sum);
@@ -7815,9 +7813,9 @@ impl<'a> Lower<'a> {
         Ok(())
     }
 
-    /// 16-bit operations, computed in f32 or i32: f16 sums, differences and
-    /// products are exact there and round once to f16 (f32 has the 2 x 11 +
-    /// 2 bits that make double rounding harmless); `None` if `name` is none.
+    /// 16-bit operations computed in f32 or i32. A product of halves is
+    /// exact in f32. Sums use the f32 result directly for nearest-even and
+    /// correct it for rounding toward zero. `None` for other instruction names.
     fn valu16(&mut self, inst: &Inst, name: &str, guard: Option<V>) -> Option<Result<(), Why>> {
         const FLOAT2: &[&str] = &[
             "v_add_f16",
@@ -7915,9 +7913,9 @@ impl<'a> Lower<'a> {
         if float2.contains(&name) {
             let (a, b) = (self.half_fsrc(inst, 0)?, self.half_fsrc(inst, 1)?);
             let r = match name {
-                "v_add_f16" => self.s.m.bin(c, Bin::Add, a, b),
-                "v_sub_f16" => self.s.m.bin(c, Bin::Sub, a, b),
-                "v_subrev_f16" => self.s.m.bin(c, Bin::Sub, b, a),
+                "v_add_f16" => self.half_add_sub(Bin::Add, a, b),
+                "v_sub_f16" => self.half_add_sub(Bin::Sub, a, b),
+                "v_subrev_f16" => self.half_add_sub(Bin::Sub, b, a),
                 "v_mul_f16" => self.s.m.bin(c, Bin::Mul, a, b),
                 "v_max_f16" => self.max_min(true, a, b),
                 _ => self.max_min(false, a, b),
@@ -8256,7 +8254,7 @@ impl<'a> Lower<'a> {
             }
             let r = if float {
                 let mut f = match op {
-                    "add_f16" => self.s.m.bin(c, Bin::Add, xs[0], xs[1]),
+                    "add_f16" => self.half_add_sub(Bin::Add, xs[0], xs[1]),
                     "mul_f16" => self.s.m.bin(c, Bin::Mul, xs[0], xs[1]),
                     "min_f16" => self.max_min(false, xs[0], xs[1]),
                     "max_f16" => self.max_min(true, xs[0], xs[1]),
