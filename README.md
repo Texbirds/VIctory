@@ -1,4 +1,31 @@
-# VIctory
+# VIctory — `Texbirds/VIctory` (`next` Integration Build)
+
+> **Community integration fork of [Marvisak/VIctory](https://github.com/Marvisak/VIctory)**
+>
+> Branch `next` integrates **153 vetted upstream pull requests** on top of `Marvisak/VIctory@63bcca4` with full original Git authorship preserved. See **[FORK_MANIFEST.md](FORK_MANIFEST.md)** for the complete list of merged PRs and contributor credits.
+
+### What's included on `next`
+
+- **NVIDIA RTX 30 / 40 / 50 unblockers:** Wave64-on-Wave32 compute & console-flow lowering (`#2309`), NVIDIA shader compiler worker stack headroom (`#1129`), capped/portable view-heap clamping (`#2628`, `#2626`), castable host formats (`#2101`), BVH builder holdback (`#2118`), root constant dword 4 fix (`#2703`), `SV_ViewportArrayIndex` / `SV_RenderTargetArrayIndex` (`#2596`), and D3D12 sampler `MipLODBias` clamping (`#3043`).
+- **Major FPS & frame-time speedups:** VRAM shadow buffers & dirty bitmaps (`#3312`), wave-level dirty-mark coalescing (`#2958`), batched indirect argument clamps (`#3197`, enable with `VICTORY_CLAMP_WINDOW=1`), early depth-stencil preservation (`#2085`), lock-free fault reads (`#3035`), multi-threaded copy-back (`#2914`), bindless fast-skip (`#3484`), DirectStorage per-worker decompressor & file handles (`#2981`, `#2904`), and keyed per-translator pipeline libraries (`#2706`, `#3046`, `#2787`).
+- **Full shaders & graphics:** Linked mesh/pixel signature pruning under D3D12's 32 KiB limit (`#2398`), partial-channel typed & sub-dword buffer stores (`#3377`), partial-channel `image_store` & `view_kind` UAV handles (`#3403`), compute dispatch spreading past 65,535 groups in X (`#2312`), WaveActiveSum binary64 (`#2978`), dual loop back-edge guard (`#1540`), mixed export joins (`#1473`), and RDNA4 buffer size handles (`#2122`).
+- **Stability, audio & Wine/Linux:** XMA audio fixes (`#2694`, `#2710`, `#2714`), save preservation (`#1981`), pipeline crash journal (`#491`, `VICTORY_PIPELINE_JOURNAL`), Wine pipeline library & Winsock fixes (`#1722`, `#2249`), and strict `xtask policy` + `clippy -D warnings` hygiene.
+
+### Quick-start tips (NVIDIA RTX 30/40/50, AMD RX 6000/7000/9000, Intel Arc)
+
+```powershell
+# Optional: enable batched indirect argument clamping (major GPU frame-time win)
+$env:VICTORY_CLAMP_WINDOW = "1"
+
+# Build & run
+cargo build --release --locked -p victory
+target\release\victory.exe translate --cache --pipelines <game dir>\shaders.rpf <game dir>\<the title's exe> <game dir>\XboxBvhBuilder.dll <game dir>\amd_fidelityfx_upscaler_xbox.dll
+target\release\victory.exe run <game dir>\<the title's exe> --execute
+```
+
+---
+
+## Upstream VIctory
 
 Runs Grand Theft Auto VI (Xbox Series X|S) natively on Windows, from files
 the user supplies.
