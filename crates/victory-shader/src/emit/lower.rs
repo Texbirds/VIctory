@@ -24,9 +24,13 @@ mod buffer_store;
 #[cfg(test)]
 mod buffer_store_tests;
 mod bvh;
+mod marks;
 mod sum64;
 #[cfg(test)]
 mod image_store_tests;
+
+#[cfg(test)]
+pub(crate) use marks::per_lane_marks;
 
 type Why = &'static str;
 type HandleProps = (u32, u32);
@@ -5343,6 +5347,9 @@ impl<'a> Lower<'a> {
             let word = self.s.m.bin(c, Bin::Shl, word, k2);
             let bit = self.s.m.bin(c, Bin::And, n, k31);
             let bit = self.s.m.bin(c, Bin::Shl, one, bit);
+            let lead = self.mark_lead(n);
+            let led = self.begin_guarded(lead);
+            let c = self.cur;
             // Most writes find their page marked: a load, not an atomic.
             let old = self.raw_dword(bitmap, word);
             let set = self.s.m.bin(c, Bin::And, old, bit);
@@ -5356,6 +5363,7 @@ impl<'a> Lower<'a> {
             // Operation 2 is OR.
             self.s.op(self.cur, "atomicBinOp.i32", Attr::NoUnwind, self.s.t.i32, 78, &[bitmap, k2, word, iu, iu, bit]);
             self.end_guarded(inner, &[]);
+            self.end_guarded(led, &[]);
         }
         self.end_guarded(outer, &[]);
     }
@@ -9237,6 +9245,9 @@ impl<'a> Lower<'a> {
         let word = self.s.m.bin(c, Bin::Shl, word, k2);
         let bit = self.s.m.bin(c, Bin::And, n, k31);
         let bit = self.s.m.bin(c, Bin::Shl, one, bit);
+        let lead = self.mark_lead(n);
+        let led = self.begin_guarded(lead);
+        let c = self.cur;
         // Most reads find their slot marked: a load, not an atomic.
         let old = self.raw_dword(bitmap, word);
         let set = self.s.m.bin(c, Bin::And, old, bit);
@@ -9246,6 +9257,7 @@ impl<'a> Lower<'a> {
         // Operation 2 is OR.
         self.s.op(self.cur, "atomicBinOp.i32", Attr::NoUnwind, self.s.t.i32, 78, &[bitmap, k2, word, iu, iu, bit]);
         self.end_guarded(at, &[]);
+        self.end_guarded(led, &[]);
         self.end_guarded(outer, &[]);
     }
 
