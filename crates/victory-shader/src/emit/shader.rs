@@ -27,12 +27,10 @@ pub const VIEW_SIGNED: u32 = 1 << 30;
 /// Where the title-memory page table is bound: `t0` (a raw root SRV) in
 /// this space (see `emit` "Title memory").
 pub const MEMORY_SPACE: u32 = 2;
-/// Heap indices are clamped below these (views, samplers): the host's heaps
-/// are at least this large, the slots past their own null (`emit`, "Heap
-/// indices").
+/// The view heap size on hosts that support more than the portable limit.
 pub const HEAP_VIEWS: u32 = 1 << 21;
 pub const HEAP_SAMPLERS: u32 = 2048;
-/// The heap index of the host's null raw buffer view (the null raw
+/// The heap index of the uncapped host's null raw buffer view (the null raw
 /// unordered access view at the index below), read instead of a slot that
 /// holds no buffer view where a shader reads one at an index it computes
 /// (`emit`, "Buffer views at computed heap indices").
@@ -94,6 +92,7 @@ pub(crate) struct Shader {
     pub m: Module,
     pub t: Types,
     pub pixel: bool,
+    pub view_limit: u32,
     pub inputs: Vec<SigElement>,
     pub outputs: Vec<SigElement>,
     /// A mesh shader's per-primitive outputs.
@@ -183,6 +182,7 @@ impl Shader {
                 res_ret,
             },
             pixel,
+            view_limit: HEAP_VIEWS,
             inputs: Vec::new(),
             outputs: Vec::new(),
             prims: Vec::new(),
@@ -524,6 +524,26 @@ impl Shader {
         )
     }
 
+    /// Redirects an out-of-range index to the heap's last slot.
+    pub fn clamp_heap_index(&mut self, block: usize, index: V, sampler: bool) -> V {
+        let last = self.m.i32(if sampler { HEAP_SAMPLERS } else { self.view_limit } - 1);
+        let over = self.m.cmp(block, pred::IUGT, index, last);
+        self.m.select(block, over, last, index)
+    }
+
+    /// On the portable heap, redirects an index the title made past its own
+    /// slots ([`super::PORTABLE_TITLE_VIEWS`]) to the null view: the host's
+    /// dynamic slots follow them.
+    pub fn clamp_title_heap_index(&mut self, block: usize, index: V) -> V {
+        if self.view_limit != super::PORTABLE_VIEWS {
+            return index;
+        }
+        let last = self.m.i32(super::PORTABLE_TITLE_VIEWS - 1);
+        let over = self.m.cmp(block, pred::IUGT, index, last);
+        let null = self.m.i32(self.view_limit - 1);
+        self.m.select(block, over, null, index)
+    }
+
     /// A descriptor heap handle, annotated with `props`; `nonuniform` when
     /// the index may differ between lanes (`NonUniformResourceIndex`).
     pub fn heap_handle(
@@ -540,11 +560,7 @@ impl Shader {
             flags::RESOURCE_HEAP
         };
         self.nonuniform_handles += u32::from(nonuniform);
-        // An index past the host's heap faults the device (a console shader
-        // reads whatever memory follows its heap): the last slot instead.
-        let last = self.m.i32(if sampler { HEAP_SAMPLERS } else { HEAP_VIEWS } - 1);
-        let over = self.m.cmp(block, pred::IUGT, index, last);
-        let index = self.m.select(block, over, last, index);
+        let index = self.clamp_heap_index(block, index, sampler);
         let (s, n) = (self.m.bool(sampler), self.m.bool(nonuniform));
         let h = self.op(
             block,

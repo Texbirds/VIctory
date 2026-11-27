@@ -83,17 +83,14 @@
 //!   vertex shader's outputs completes each rectangle with its fourth
 //!   corner opposite the right angle ([`right_angle`]), as the console's
 //!   hardware does.
-//! * **Heap indices** (added 2026-11-24) are clamped to [`HEAP_VIEWS`] − 1
-//!   (samplers [`HEAP_SAMPLERS`] − 1): the host's heaps have at least that
-//!   many slots, those past its own null, so an index past the heap (data
-//!   still wrong; the console would read whatever memory follows its heap)
-//!   reads nothing instead of faulting the device.
+//! * **Heap indices** are clamped to the last host view or sampler slot.
+//!   On hosts with capped view heaps the last view slot is 999,999.
 //! * **Buffer views at computed heap indices** (added 2026-11-24): a
 //!   buffer read through a descriptor the shader takes from the resource
 //!   heap itself first looks up the view-stride table (root SRV
 //!   `t`[`VIEW_STRIDES`], which then covers every index below
 //!   [`HEAP_VIEWS`], dynamic slots too); where it holds 0 (no buffer view
-//!   there) the shader reads heap index [`NULL_BUFFER_VIEW`] instead (for
+//!   there) the shader reads the penultimate view slot instead (for
 //!   unordered access the index below), which the host keeps a null raw
 //!   buffer SRV (UAV). The index comes from data, and a texture descriptor
 //!   read as a buffer one is a wild address (the texture's shifted 8 bits
@@ -368,6 +365,13 @@ pub struct UserData {
     pub dword: u32,
 }
 
+/// The portable shader-visible view heap size.
+pub const PORTABLE_VIEWS: u32 = 1_000_000;
+
+/// The title's slots in the portable view heap. The host's dynamic slots
+/// (2^18) and the three null views follow them.
+pub const PORTABLE_TITLE_VIEWS: u32 = PORTABLE_VIEWS - 3 - (1 << 18);
+
 /// How a translation is made.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct Options {
@@ -375,6 +379,15 @@ pub struct Options {
     /// "Write marks"); the host must then bind the view-mark table and the
     /// bitmap ([`HostShader::view_marks`]).
     pub view_marks: bool,
+    /// The host uses the portable one-million-descriptor view heap.
+    pub portable_views: bool,
+}
+
+impl Options {
+    /// The number of view slots addressable by translated shaders.
+    pub fn view_heap_limit(self) -> u32 {
+        if self.portable_views { PORTABLE_VIEWS } else { HEAP_VIEWS }
+    }
 }
 
 /// Translates the vertex, pixel, compute or mesh program of a console
@@ -500,14 +513,14 @@ pub fn emit_with(
         mesh_stride,
         view_marks: options.view_marks,
     };
-    let l = match lower::lower(&parts(st, res)) {
+    let l = match lower::lower_with_limit(&parts(st, res), options.view_heap_limit()) {
         // Discarded lanes kept on as helpers can read what no surviving
         // lane does (a register only killed lanes skipped writing); such a
         // program kills them as the console does (`structure::killing`).
         Err(_) if !st.discards.is_empty() => {
             let st = structure::killing(p)?;
             let res = resource::track(p, &native.layout, native.stage, Some(&st))?;
-            lower::lower(&parts(&st, &res))?
+            lower::lower_with_limit(&parts(&st, &res), options.view_heap_limit())?
         }
         l => l?,
     };

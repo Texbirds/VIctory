@@ -1216,6 +1216,48 @@ mod tests {
     use super::*;
 
     #[test]
+    fn heap_handles_clamp_to_the_selected_last_slot() {
+        use super::super::shader::{HEAP_SAMPLERS, HEAP_VIEWS, Shader};
+
+        for (limit, sampler, expected) in [
+            (1_000_000, false, 999_999),
+            (HEAP_VIEWS, false, HEAP_VIEWS - 1),
+            (1_000_000, true, HEAP_SAMPLERS - 1),
+        ] {
+            let mut s = Shader::new(false);
+            s.view_limit = limit;
+            let index = s.m.undef(s.t.i32);
+            s.heap_handle(s.entry, index, sampler, true, (1, 0));
+            let last = s.m.i32(expected);
+            let args = s.m.insts.iter().find_map(|inst| match &inst.op {
+                Op::Call(f, args) if s.m.funcs[*f as usize].name.contains("createHandleFromHeap") => Some(args),
+                _ => None,
+            }).unwrap();
+            let V::Inst(selected) = args[1] else { panic!("expected a clamped index") };
+            let Op::Select(V::Inst(over), t, f) = s.m.insts[selected as usize].op else { panic!("expected a select") };
+            assert_eq!((t, f), (last, index));
+            assert!(matches!(s.m.insts[over as usize].op, Op::Cmp(pred::IUGT, a, b) if (a, b) == (index, last)));
+        }
+    }
+
+    #[test]
+    fn title_indices_past_the_portable_title_slots_read_the_null_view() {
+        use super::super::shader::{HEAP_VIEWS, Shader};
+        use super::super::{PORTABLE_TITLE_VIEWS, PORTABLE_VIEWS};
+
+        let mut s = Shader::new(false);
+        let index = s.m.undef(s.t.i32);
+        s.view_limit = HEAP_VIEWS;
+        assert_eq!(s.clamp_title_heap_index(s.entry, index), index);
+        s.view_limit = PORTABLE_VIEWS;
+        let V::Inst(selected) = s.clamp_title_heap_index(s.entry, index) else { panic!("expected a select") };
+        let (last, null) = (s.m.i32(PORTABLE_TITLE_VIEWS - 1), s.m.i32(PORTABLE_VIEWS - 1));
+        let Op::Select(V::Inst(over), t, f) = s.m.insts[selected as usize].op else { panic!("expected a select") };
+        assert_eq!((t, f), (null, index));
+        assert!(matches!(s.m.insts[over as usize].op, Op::Cmp(pred::IUGT, a, b) if (a, b) == (index, last)));
+    }
+
+    #[test]
     fn vbr_and_blocks() {
         let mut w = Writer::default();
         w.vbr(5, 6);
