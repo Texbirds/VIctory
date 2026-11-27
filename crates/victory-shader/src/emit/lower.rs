@@ -25,8 +25,11 @@ mod buffer_store;
 mod buffer_store_tests;
 mod bvh;
 mod sum64;
+#[cfg(test)]
+mod image_store_tests;
 
 type Why = &'static str;
+type HandleProps = (u32, u32);
 
 #[derive(Debug, Clone, Copy)]
 enum Val {
@@ -36,6 +39,8 @@ enum Val {
 }
 
 pub(crate) struct Lowered {
+    #[cfg(test)]
+    pub typed_texture_annotations: [bool; 2],
     pub dxil: Vec<u8>,
     /// Bit n: immediate sampler n is a comparison sampler.
     pub cmp_samplers: u64,
@@ -292,16 +297,15 @@ struct Lower<'a> {
     scalar: HashMap<Site, Address>,
     exports: HashMap<Site, &'a Export>,
     interps: HashMap<Site, &'a Interp>,
-    #[allow(clippy::type_complexity)]
-    handles: HashMap<(usize, Site, u8, bool, (u32, u32)), V>,
+    handles: HashMap<(usize, Site, u8, bool, HandleProps), V>,
     /// Handles made in the entry block for descriptors at addresses the
     /// root parameters alone give (table and heap loads with no other
     /// term), by base value, byte offset, dword, offset register, sampler
     /// heap and properties ([`Lower::entry_address`]).
-    entry_handles: HashMap<(EntryAddress, u8, bool, (u32, u32)), V>,
+    entry_handles: HashMap<(EntryAddress, u8, bool, HandleProps), V>,
     /// Handles of descriptors chosen by control flow, made in their join
     /// block, by the choice (its `Debug` text), sampler heap and properties.
-    join_handles: HashMap<(String, bool, (u32, u32)), V>,
+    join_handles: HashMap<(String, bool, HandleProps), V>,
     /// Binary64 sums whole-wave sections leave (as i64), by block, low and
     /// high source dwords and mask: one wave operation serves both dwords.
     sums64: HashMap<(usize, Value, Value, Value), V>,
@@ -1875,6 +1879,8 @@ impl<'a> Lower<'a> {
         let view_addresses = self.s.view_addresses.is_some();
         let cmp_samplers = self.s.cmp_samplers;
         Ok(Lowered {
+            #[cfg(test)]
+            typed_texture_annotations: [0x409, 0x405].map(|n| self.s.m.has_i32_const(n)),
             cmp_samplers,
             root_cbvs,
             root_srvs,
@@ -5245,7 +5251,11 @@ impl<'a> Lower<'a> {
     /// and whether a signed one, from the view-stride table; `None` if the
     /// handle's heap index is not known.
     fn integer_view(&mut self, h: V) -> Option<(V, V)> {
-        let index = *self.s.view_index.get(&h)?;
+        let index = *self
+            .s
+            .view_index
+            .get(&h)
+            .or_else(|| self.s.texture_uav_index.get(&h))?;
         let word = self.view_word(index);
         let c = self.cur;
         let zero = self.s.m.i32(0);
@@ -5947,7 +5957,7 @@ impl<'a> Lower<'a> {
     /// for the instruction's read mark (handles are made once per block,
     /// often before the instruction). A view read through a table needs
     /// none: the host makes the slot for the draw.
-    fn handle(&mut self, site: Site, src: &Source, sampler: bool, props: (u32, u32)) -> Result<V, Why> {
+    fn handle(&mut self, site: Site, src: &Source, sampler: bool, props: HandleProps) -> Result<V, Why> {
         let h = self.handle_made(site, src, sampler, props)?;
         if let Some(&index) = self.s.texture_index.get(&h)
             && self.is_heap_direct(src)
@@ -5962,7 +5972,7 @@ impl<'a> Lower<'a> {
         site: Site,
         src: &Source,
         sampler: bool,
-        props: (u32, u32),
+        props: HandleProps,
     ) -> Result<V, Why> {
         let props = if self.pops && props.0 & 0x1000 != 0 {
             self.s.flags |= flags::ROVS;
@@ -9132,8 +9142,9 @@ impl<'a> Lower<'a> {
             // BVH lowering applies its own guard and uses no texture views.
             return self.bvh(inst, b, i).map(|()| None);
         }
+        let raw_dmask = *dmask;
         // A load or sample with no channel enabled returns the first.
-        let dmask = if *dmask == 0 { &1 } else { dmask };
+        let dmask = if raw_dmask == 0 { &1 } else { dmask };
         let site = (b, i);
         let guard = self.guard(b, i)?;
         let c = self.cur;
@@ -9322,13 +9333,15 @@ impl<'a> Lower<'a> {
             return Ok(guard);
         }
         if store {
-            if name != "image_store" {
+            if name.contains("_mip") {
                 return Err("an image store to a mip level");
             }
-            // shortcut: stores are taken to write all four channels of a
-            // float format (the console converts by the view's format).
-            if *dmask != 0xF {
-                return Err("an image store of some channels");
+            if name != "image_store" {
+                return Err("a packed image store");
+            }
+            // RDNA2 `image_store` with dmask=0 writes nothing.
+            if raw_dmask == 0 {
+                return Ok(None);
             }
             let iu = self.s.m.undef(self.s.t.i32);
             let mut cs = vec![iu; 3];
@@ -9338,31 +9351,99 @@ impl<'a> Lower<'a> {
             let Operand::Vector { reg, .. } = *data else {
                 return Err("image store data");
             };
-            let mut vals = Vec::new();
-            for k in 0..4u8 {
-                // d16: two f16 channels per VGPR, low half first.
-                let r = if *d16 { k / 2 } else { k };
+            let h = self.handle(site, src, false, props)?;
+            // For `d16` on integer texture views (flagged in the view-stride
+            // table), store zero-/sign-extended 16-bit integers through an
+            // integer-typed handle (`textureStore.i32`) instead of converting
+            // as f16 through `textureStore.f32`.
+            let integer = if *d16 { self.integer_view(h) } else { None };
+            // DXIL typed UAV `textureStore` requires write mask 0xF and
+            // non-undef values for all four channels; RDNA2 `image_store`
+            // packs only the `dmask`-enabled channels in ascending bit order
+            // (and with `d16`, two 16-bit channels per VGPR, low half first).
+            // Hardware ignores channels past the bound UAV format's width.
+            let mut vals_f = [self.s.m.f32(0); 4];
+            let mut vals_i = [self.s.m.i32(0); 4];
+            let mut slot = 0u8;
+            for k in 0..4usize {
+                if raw_dmask & (1 << k) == 0 {
+                    continue;
+                }
+                let r = if *d16 { slot / 2 } else { slot };
                 let v = inst.read(Reg::V(reg + r)).ok_or("image store data")?;
-                vals.push(if *d16 {
+                vals_f[k] = if *d16 {
+                    let c = self.cur;
                     let mut x = self.i32_of(v)?;
-                    if k % 2 == 1 {
+                    if slot % 2 == 1 {
                         let k16 = self.s.m.i32(16);
-                        x = self.s.m.bin(self.cur, Bin::LShr, x, k16);
+                        x = self.s.m.bin(c, Bin::LShr, x, k16);
                     }
                     let f32t = self.s.t.f32;
-                    self.s
-                        .op(self.cur, "legacyF16ToF32", Attr::ReadNone, f32t, 131, &[x])
+                    let f = self
+                        .s
+                        .op(c, "legacyF16ToF32", Attr::ReadNone, f32t, 131, &[x]);
+                    if let Some((_, signed)) = integer {
+                        let (k16, low) = (self.s.m.i32(16), self.s.m.i32(0xFFFF));
+                        let zero_ext = self.s.m.bin(c, Bin::And, x, low);
+                        let up = self.s.m.bin(c, Bin::Shl, x, k16);
+                        let sign_ext = self.s.m.bin(c, Bin::AShr, up, k16);
+                        vals_i[k] = self.s.m.select(c, signed, sign_ext, zero_ext);
+                    }
+                    f
                 } else {
                     self.float_of(v)?
-                });
+                };
+                slot += 1;
             }
-            let h = self.handle(site, src, false, props)?;
+            let void = self.s.t.void;
+            if let Some((int, _)) = integer {
+                let h_int = self.handle(site, src, false, (kind | 0x1000, 0x405))?;
+                let c = self.cur;
+                let one = self.s.m.bool(true);
+                let not_int = self.s.m.bin(c, Bin::Xor, int, one);
+                let int_guard = match guard {
+                    Some(g) => Some(self.s.m.bin(c, Bin::And, g, int)),
+                    None => Some(int),
+                };
+                let flt_guard = match guard {
+                    Some(g) => Some(self.s.m.bin(c, Bin::And, g, not_int)),
+                    None => Some(not_int),
+                };
+                let at = self.begin_guarded(int_guard);
+                let mut args = vec![h_int];
+                args.extend(&cs);
+                args.extend(vals_i);
+                args.push(self.s.m.i8(0xF));
+                self.s.op(
+                    self.cur,
+                    "textureStore.i32",
+                    Attr::NoUnwind,
+                    void,
+                    67,
+                    &args,
+                );
+                self.end_guarded(at, &[]);
+                let at = self.begin_guarded(flt_guard);
+                let mut args = vec![h];
+                args.extend(cs);
+                args.extend(vals_f);
+                args.push(self.s.m.i8(0xF));
+                self.s.op(
+                    self.cur,
+                    "textureStore.f32",
+                    Attr::NoUnwind,
+                    void,
+                    67,
+                    &args,
+                );
+                self.end_guarded(at, &[]);
+                return Ok(guard);
+            }
             let at = self.begin_guarded(guard);
             let mut args = vec![h];
             args.extend(cs);
-            args.extend(vals);
+            args.extend(vals_f);
             args.push(self.s.m.i8(0xF));
-            let void = self.s.t.void;
             self.s.op(
                 self.cur,
                 "textureStore.f32",

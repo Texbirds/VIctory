@@ -1802,6 +1802,9 @@ pub enum View<'a> {
     UintTextureUav(u32, u32),
     /// An R32G32_UINT texture UAV (width, height), zeroed (64-bit atomics).
     Uint2TextureUav(u32, u32),
+    /// A typed 2D texture UAV in this format, of `(width, height)` texels of
+    /// this many dwords, zeroed.
+    TypedTextureUav(DXGI_FORMAT, u32, u32, u32),
     /// A typed RGBA16F buffer UAV of this many elements, zeroed.
     HalfUav(u32),
     /// A typed buffer UAV in this format, of this many elements of this many
@@ -1949,29 +1952,28 @@ impl Host {
                 Flags: flags,
                 ..Default::default()
             };
-            // Texel words: 4 for RGBA32F, 1 for R32_UINT, 2 for R32G32_UINT.
             let footprint_as =
-                |r: &ID3D12Resource, w: u32, h: u32, words: u32| D3D12_TEXTURE_COPY_LOCATION {
-                    pResource: std::mem::transmute_copy(r),
-                    Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
-                    Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
-                        PlacedFootprint: D3D12_PLACED_SUBRESOURCE_FOOTPRINT {
-                            Offset: 0,
-                            Footprint: D3D12_SUBRESOURCE_FOOTPRINT {
-                                Format: match words {
-                                    1 => DXGI_FORMAT_R32_UINT,
-                                    2 => DXGI_FORMAT_R32G32_UINT,
-                                    _ => DXGI_FORMAT_R32G32B32A32_FLOAT,
+                |r: &ID3D12Resource, w: u32, h: u32, format: DXGI_FORMAT, words: u32| {
+                    D3D12_TEXTURE_COPY_LOCATION {
+                        pResource: std::mem::transmute_copy(r),
+                        Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
+                        Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
+                            PlacedFootprint: D3D12_PLACED_SUBRESOURCE_FOOTPRINT {
+                                Offset: 0,
+                                Footprint: D3D12_SUBRESOURCE_FOOTPRINT {
+                                    Format: format,
+                                    Width: w,
+                                    Height: h,
+                                    Depth: 1,
+                                    RowPitch: (w * 4 * words).next_multiple_of(256),
                                 },
-                                Width: w,
-                                Height: h,
-                                Depth: 1,
-                                RowPitch: (w * 4 * words).next_multiple_of(256),
                             },
                         },
-                    },
+                    }
                 };
-            let footprint = |r: &ID3D12Resource, w: u32, h: u32| footprint_as(r, w, h, 4);
+            let footprint = |r: &ID3D12Resource, w: u32, h: u32| {
+                footprint_as(r, w, h, DXGI_FORMAT_R32G32B32A32_FLOAT, 4)
+            };
             let subresource = |r: &ID3D12Resource| D3D12_TEXTURE_COPY_LOCATION {
                 pResource: std::mem::transmute_copy(r),
                 Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
@@ -2011,7 +2013,7 @@ impl Host {
                     Some((w, h)) => {
                         let pitch = (w * 4 * n).next_multiple_of(256);
                         let zeros = upload(&vec![0; (pitch * h / 4) as usize])?;
-                        let from = footprint_as(&zeros, w, h, n);
+                        let from = footprint_as(&zeros, w, h, r.GetDesc().Format, n);
                         list.CopyTextureRegion(&subresource(r), 0, 0, 0, &from, None);
                         zeros
                     }
@@ -2244,10 +2246,14 @@ impl Host {
                         )?;
                         uavs.push((t, Some((w, h)), 4, rb));
                     }
-                    View::UintTextureUav(w, h) | View::Uint2TextureUav(w, h) => {
+                    View::UintTextureUav(w, h)
+                    | View::Uint2TextureUav(w, h)
+                    | View::TypedTextureUav(_, w, h, _) => {
                         let (format, words) = match *v {
                             View::UintTextureUav(..) => (DXGI_FORMAT_R32_UINT, 1),
-                            _ => (DXGI_FORMAT_R32G32_UINT, 2),
+                            View::Uint2TextureUav(..) => (DXGI_FORMAT_R32G32_UINT, 2),
+                            View::TypedTextureUav(format, _, _, words) => (format, words),
+                            _ => unreachable!(),
                         };
                         let t = make(
                             D3D12_HEAP_TYPE_DEFAULT,
@@ -2478,7 +2484,7 @@ impl Host {
                 )]);
                 match size {
                     Some((w, h)) => list.CopyTextureRegion(
-                        &footprint_as(rb, *w, *h, *n),
+                        &footprint_as(rb, *w, *h, r.GetDesc().Format, *n),
                         0,
                         0,
                         0,

@@ -9,13 +9,13 @@ use windows::Win32::Graphics::Direct3D12::D3D12_SAMPLER_DESC;
 
 use windows::Win32::Graphics::Dxgi::Common::{
     DXGI_FORMAT, DXGI_FORMAT_R16_FLOAT, DXGI_FORMAT_R16_UINT, DXGI_FORMAT_R16G16_FLOAT,
-    DXGI_FORMAT_R16G16_UINT, DXGI_FORMAT_R16G16B16A16_FLOAT, DXGI_FORMAT_R16G16B16A16_UINT,
-    DXGI_FORMAT_R32_FLOAT, DXGI_FORMAT_R32G32_FLOAT, DXGI_FORMAT_R32G32B32A32_FLOAT,
-    DXGI_FORMAT_R32G32B32A32_UINT,
+    DXGI_FORMAT_R16G16_SINT, DXGI_FORMAT_R16G16_UINT, DXGI_FORMAT_R16G16B16A16_FLOAT,
+    DXGI_FORMAT_R16G16B16A16_UINT, DXGI_FORMAT_R32_FLOAT, DXGI_FORMAT_R32_UINT,
+    DXGI_FORMAT_R32G32_FLOAT, DXGI_FORMAT_R32G32B32A32_FLOAT, DXGI_FORMAT_R32G32B32A32_UINT,
 };
 
 use super::host::{Dispatch, Host, Root, Stride, View};
-use super::{HostShader, StaticSampler, VIEW_INTEGER, VIEW_STRIDES, lower, validator};
+use super::{HostShader, StaticSampler, VIEW_INTEGER, VIEW_SIGNED, VIEW_STRIDES, lower, validator};
 use crate::native::{
     ComputeIo, HwStage, NativeProgram, ResourceType, RootParam, RootType, StageIo, UsedResource,
 };
@@ -1197,4 +1197,289 @@ fn indexed_subword_buffer_stores_handle_soffset_and_straddling_half() {
         ran += 1;
     }
     assert!(ran > 0, "neither hardware nor WARP SM 6.6 device available");
+}
+
+/// Partial-channel `image_store` (`dmask` 0x1, 0x3, sparse 0x5, 32-bit and
+/// `d16`, plus `dmask=0` no-op) writes the expected texel bytes on hardware
+/// and WARP across float and integer 2D texture UAV formats.
+#[test]
+fn partial_dmask_image_stores_write_typed_texture_uavs() {
+    let run = |shader: &HostShader, views: &[View], strides: Vec<u32>| {
+        if !shader.root_srvs.is_empty() {
+            return run_tables(shader, views, strides);
+        }
+        let _one = super::valu_tests::ONE_AT_A_TIME
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let mut out = Vec::new();
+        for (label, warp) in [("hardware", false), ("warp", true)] {
+            let Ok(host) = Host::new(warp) else {
+                eprintln!("no SM 6.6 {label} device; skipped");
+                continue;
+            };
+            let (root, pso) = host
+                .compute_pipeline(shader)
+                .unwrap_or_else(|e| panic!("{label}: compute_pipeline failed: {e}"));
+            let mut ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
+            for u in &shader.user_data {
+                ud[u.index as usize] = 32 * u32::from(u.slot);
+            }
+            let words = host
+                .dispatch(
+                    &root,
+                    &pso,
+                    &Dispatch {
+                        roots: vec![(0, Root::Constants(ud))],
+                        views,
+                        samplers: &[],
+                        groups: [1, 1, 1],
+                    },
+                )
+                .unwrap_or_else(|e| panic!("{label}: dispatch failed: {e}"));
+            out.push((label, words));
+        }
+        assert!(
+            !out.is_empty(),
+            "neither hardware nor WARP SM 6.6 device available"
+        );
+        out
+    };
+
+    // s0: 2D texture UAV (8 dwords -> s[8:15]), s1: raw SRV (4 dwords -> s[16:19]).
+    let make_1dw_store = |dmask: u32, d16: bool| -> HostShader {
+        let code = [
+            0xBE84_0300, // s_mov_b32 s4, s0
+            0xBE85_0380, // s_mov_b32 s5, 0
+            0xF40C_0202,
+            0xFA00_0000, // s_load_dwordx8 s[8:15], s[4:5], 0x0
+            0xBE86_0301, // s_mov_b32 s6, s1
+            0xBE87_0380, // s_mov_b32 s7, 0
+            0xF408_0403,
+            0xFA00_0000, // s_load_dwordx4 s[16:19], s[6:7], 0x0
+            0x3406_0082, // v_lshlrev_b32 v3, 2, v0
+            0x7E08_0300, // v_mov_b32 v4, v0 (x)
+            0x7E0A_0280, // v_mov_b32 v5, 0  (y)
+            0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+            0xE030_1000,
+            0x8004_0103, // buffer_load_dword v1, v3, s[16:19], 0 offen
+            0xBF8C_3F70, // s_waitcnt vmcnt(0)
+            0xF020_1008 | (dmask << 8),
+            (u32::from(d16) << 31) | 0x0002_0104, // image_store v1, v[4:5], s[8:15] dim:2D unorm
+            0xBF81_0000,                          // s_endpgm
+        ];
+        build(
+            &code,
+            vec![param(RootType::Table, 0), param(RootType::Table, 1)],
+            vec![
+                entry(ResourceType::Uav, 8, 0),
+                entry(ResourceType::Srv, 4, 1),
+            ],
+            32,
+        )
+    };
+
+    // 1. dmask=0x1 (32-bit) -> R32_FLOAT and R32_UINT.
+    let f32s: Vec<u32> = (0..32u32).map(|l| (l as f32 + 0.5).to_bits()).collect();
+    let u32s: Vec<u32> = (0..32u32).map(|l| 0x1000_0000 + l * 7).collect();
+    let store_x = make_1dw_store(0x1, false);
+    for (format, data) in [
+        (DXGI_FORMAT_R32_FLOAT, &f32s),
+        (DXGI_FORMAT_R32_UINT, &u32s),
+    ] {
+        let views = [
+            View::TypedTextureUav(format, 32, 1, 1),
+            View::Buffer {
+                data,
+                stride: Stride::Raw,
+            },
+        ];
+        for (label, words) in run(&store_x, &views, vec![0, 4]) {
+            assert_eq!(words[0], *data, "{label} {format:?} dmask=0x1");
+        }
+    }
+
+    // 2. dmask=0x3 (32-bit) -> R32G32_FLOAT (2 dwords per texel).
+    let xy_code = [
+        0xBE84_0300, // s_mov_b32 s4, s0
+        0xBE85_0380, // s_mov_b32 s5, 0
+        0xF40C_0202,
+        0xFA00_0000, // s_load_dwordx8 s[8:15], s[4:5], 0x0
+        0xBE86_0301, // s_mov_b32 s6, s1
+        0xBE87_0380, // s_mov_b32 s7, 0
+        0xF408_0403,
+        0xFA00_0000, // s_load_dwordx4 s[16:19], s[6:7], 0x0
+        0x3406_0083, // v_lshlrev_b32 v3, 3, v0
+        0x7E08_0300, // v_mov_b32 v4, v0 (x)
+        0x7E0A_0280, // v_mov_b32 v5, 0  (y)
+        0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+        0xE034_1000,
+        0x8004_0103, // buffer_load_dwordx2 v[1:2], v3, s[16:19], 0 offen
+        0xBF8C_3F70, // s_waitcnt vmcnt(0)
+        0xF020_1308,
+        0x0002_0104, // image_store v[1:2], v[4:5], s[8:15] dmask:0x3 dim:2D unorm
+        0xBF81_0000, // s_endpgm
+    ];
+    let xy_shader = build(
+        &xy_code,
+        vec![param(RootType::Table, 0), param(RootType::Table, 1)],
+        vec![
+            entry(ResourceType::Uav, 8, 0),
+            entry(ResourceType::Srv, 4, 1),
+        ],
+        32,
+    );
+    let f32_pairs: Vec<u32> = (0..32u32)
+        .flat_map(|l| [(l as f32 + 1.0).to_bits(), (l as f32 * -0.25).to_bits()])
+        .collect();
+    let views = [
+        View::TypedTextureUav(DXGI_FORMAT_R32G32_FLOAT, 32, 1, 2),
+        View::Buffer {
+            data: &f32_pairs,
+            stride: Stride::Raw,
+        },
+    ];
+    for (label, words) in run(&xy_shader, &views, vec![0, 4]) {
+        assert_eq!(words[0], f32_pairs, "{label} R32G32_FLOAT dmask=0x3");
+    }
+
+    // 3. dmask=0x3 (d16) -> R16G16_FLOAT and R16G16_UINT (two 16-bit channels in 1 VGPR).
+    let f16_pairs: Vec<u32> = (0..32u32)
+        .map(|l| (0x3C00 + l) | ((0x4000 + l) << 16))
+        .collect();
+    let u16_pairs: Vec<u32> = (0..32u32)
+        .map(|l| (0x3C00 + l) | ((0xF000 | l) << 16))
+        .collect();
+    let i16_pairs: Vec<u32> = (0..32u32)
+        .map(|lane| (0x7FFF - lane) | ((0x8000 + lane) << 16))
+        .collect();
+    let d16_xy = make_1dw_store(0x3, true);
+    for (format, stride, data) in [
+        (DXGI_FORMAT_R16G16_FLOAT, 0, &f16_pairs),
+        (DXGI_FORMAT_R16G16_UINT, VIEW_INTEGER, &u16_pairs),
+        (
+            DXGI_FORMAT_R16G16_SINT,
+            VIEW_INTEGER | VIEW_SIGNED,
+            &i16_pairs,
+        ),
+    ] {
+        let views = [
+            View::TypedTextureUav(format, 32, 1, 1),
+            View::Buffer {
+                data,
+                stride: Stride::Raw,
+            },
+        ];
+        for (label, words) in run(&d16_xy, &views, vec![stride, 4]) {
+            assert_eq!(words[0], *data, "{label} {format:?} dmask=0x3 d16");
+        }
+    }
+
+    // Seed every channel before a sparse store. The unselected channels
+    // must become zero, and Alpha is discarded by a two-channel view.
+    let rw_code = [
+        0xBE84_0300, // s_mov_b32 s4, s0
+        0xBE85_0380, // s_mov_b32 s5, 0
+        0xF40C_0202,
+        0xFA00_0000, // s_load_dwordx8 s[8:15], s[4:5], 0
+        0x7E02_02F0, // v_mov_b32 v1, 0.5
+        0x7E04_02F2, // v_mov_b32 v2, 1.0
+        0x7E06_02F4, // v_mov_b32 v3, 2.0
+        0x7E08_02F6, // v_mov_b32 v4, 4.0
+        0x7E0A_0300, // v_mov_b32 v5, v0 (x)
+        0x7E0C_0280, // v_mov_b32 v6, 0 (y)
+        0xBF8C_0000,
+        0xF020_1F08,
+        0x0002_0105, // image_store v[1:4], v[5:6], dmask:0xF
+        0xBF8C_0000,
+        0x7E02_02FF,
+        0x4180_0000, // v_mov_b32 v1, 16.0
+        0x7E04_02FF,
+        0x4200_0000, // v_mov_b32 v2, 32.0
+        0xF020_1908,
+        0x0002_0105, // image_store v[1:2], v[5:6], dmask:0x9
+        0xBF81_0000,
+    ];
+    let shader = build(
+        &rw_code,
+        vec![param(RootType::Table, 0)],
+        vec![entry(ResourceType::Uav, 8, 0)],
+        32,
+    );
+    for (view, texel) in [
+        (View::TextureUav(32, 1), &[16.0f32, 0.0, 0.0, 32.0][..]),
+        (
+            View::TypedTextureUav(DXGI_FORMAT_R32G32_FLOAT, 32, 1, 2),
+            &[16.0, 0.0][..],
+        ),
+    ] {
+        let want: Vec<_> = texel.iter().map(|x| x.to_bits()).collect();
+        for (label, words) in run(&shader, &[view], vec![0]) {
+            assert_eq!(words[0], want.repeat(32), "{label} dmask=0x9 whole texel");
+        }
+    }
+
+    // 4. Sparse dmask=0x5 (d16: R and B from 1 VGPR) -> R16G16B16A16_FLOAT.
+    // G and A are disabled in dmask and filled with 0.0f.
+    let sparse_want: Vec<u32> = f16_pairs
+        .iter()
+        .flat_map(|&p| [p & 0xFFFF, p >> 16])
+        .collect();
+    let views = [
+        View::TypedTextureUav(DXGI_FORMAT_R16G16B16A16_FLOAT, 32, 1, 2),
+        View::Buffer {
+            data: &f16_pairs,
+            stride: Stride::Raw,
+        },
+    ];
+    for (label, words) in run(&make_1dw_store(0x5, true), &views, vec![0, 4]) {
+        assert_eq!(
+            words[0], sparse_want,
+            "{label} R16G16B16A16_FLOAT dmask=0x5 d16"
+        );
+    }
+
+    // 5. dmask=0x0 is a no-op: writing f32s with dmask=0x1 then storing 0.0
+    // with dmask=0x0 leaves every texel unchanged.
+    let noop_code = [
+        0xBE84_0300, // s_mov_b32 s4, s0
+        0xBE85_0380, // s_mov_b32 s5, 0
+        0xF40C_0202,
+        0xFA00_0000, // s_load_dwordx8 s[8:15], s[4:5], 0x0
+        0xBE86_0301, // s_mov_b32 s6, s1
+        0xBE87_0380, // s_mov_b32 s7, 0
+        0xF408_0403,
+        0xFA00_0000, // s_load_dwordx4 s[16:19], s[6:7], 0x0
+        0x3406_0082, // v_lshlrev_b32 v3, 2, v0
+        0x7E08_0300, // v_mov_b32 v4, v0 (x)
+        0x7E0A_0280, // v_mov_b32 v5, 0  (y)
+        0x7E04_0280, // v_mov_b32 v2, 0  (sentinel for dmask=0 store)
+        0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+        0xE030_1000,
+        0x8004_0103, // buffer_load_dword v1, v3, s[16:19], 0 offen
+        0xBF8C_3F70, // s_waitcnt vmcnt(0)
+        0xF020_1108,
+        0x0002_0104, // image_store v1, v[4:5], s[8:15] dmask:0x1 dim:2D unorm
+        0xF020_1008,
+        0x0002_0204, // image_store v2, v[4:5], s[8:15] dmask:0x0 dim:2D unorm (no-op)
+        0xBF81_0000, // s_endpgm
+    ];
+    let noop_shader = build(
+        &noop_code,
+        vec![param(RootType::Table, 0), param(RootType::Table, 1)],
+        vec![
+            entry(ResourceType::Uav, 8, 0),
+            entry(ResourceType::Srv, 4, 1),
+        ],
+        32,
+    );
+    let views = [
+        View::TypedTextureUav(DXGI_FORMAT_R32_FLOAT, 32, 1, 1),
+        View::Buffer {
+            data: &f32s,
+            stride: Stride::Raw,
+        },
+    ];
+    for (label, words) in run(&noop_shader, &views, vec![0, 4]) {
+        assert_eq!(words[0], f32s, "{label} R32_FLOAT dmask=0x0 no-op");
+    }
 }

@@ -140,6 +140,7 @@ pub(crate) struct Shader {
     /// are marked, `emit` "Read marks"), and those the instruction being
     /// lowered uses.
     pub texture_index: std::collections::HashMap<V, V>,
+    pub texture_uav_index: std::collections::HashMap<V, V>,
     pub texture_reads: Vec<V>,
     pub flags: u64,
     /// Heap handles made with a non-uniform index.
@@ -223,6 +224,7 @@ impl Shader {
             view_writes: None,
             view_index: std::collections::HashMap::new(),
             texture_index: std::collections::HashMap::new(),
+            texture_uav_index: std::collections::HashMap::new(),
             texture_reads: Vec::new(),
             flags: 0,
             nonuniform_handles: 0,
@@ -604,6 +606,10 @@ impl Shader {
         // Texture shader views (kinds 1-9).
         if !sampler && props.0 & 0x1000 == 0 && (1..=9).contains(&kind) {
             self.texture_index.insert(h, index);
+        }
+        // Texture unordered access views (kinds 1-9).
+        if !sampler && props.0 & 0x1000 != 0 && (1..=9).contains(&kind) {
+            self.texture_uav_index.insert(h, index);
         }
         h
     }
