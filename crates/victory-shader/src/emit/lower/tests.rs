@@ -4,7 +4,7 @@ use crate::native::{
 };
 use crate::{io, ir, resource, structure};
 
-const S_ENDPGM: u32 = 0xBF81_0000;
+pub(super) const S_ENDPGM: u32 = 0xBF81_0000;
 
 /// A program's constant table starts after its instructions, unless a
 /// load at a fixed offset reads below that.
@@ -76,7 +76,7 @@ fn lowers_as(words: &[u32], rsrc2: u32, per_lane_only: bool) -> Result<(), crate
 
 /// Lowers a compute program with the root parameters `layout` (in user
 /// SGPRs from s0 on) and the used resources `used`.
-fn lower_with(
+pub(super) fn lower_with(
     words: &[u32],
     layout: Vec<RootParam>,
     used: Vec<UsedResource>,
