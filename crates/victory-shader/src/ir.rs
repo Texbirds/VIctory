@@ -169,16 +169,12 @@ pub fn build_bounded(
     vgprs: u16,
     m0_max: &HashMap<usize, u8>,
 ) -> Result<Program, ShaderError> {
-    let list = gfx10::decode(code)?;
+    let (list, flows) = gfx10::decode_with_flows(code)?;
     let lanes = 1 + u8::from(wave64);
     let isa = |offset, reason| ShaderError::Isa { offset, reason };
 
-    let mut flows = Vec::with_capacity(list.len());
     let mut leaders = vec![0];
-    for (i, inst) in list.iter().enumerate() {
-        let flow = gfx10::control(inst, code.len(), |at| {
-            list[..list.partition_point(|i| i.offset < at)].last()
-        })?;
+    for (i, &flow) in flows.iter().enumerate() {
         if let Flow::Jump(t) | Flow::Branch(t) = flow {
             leaders.push(t);
         }
@@ -187,7 +183,6 @@ pub fn build_bounded(
         {
             leaders.push(next.offset);
         }
-        flows.push(flow);
     }
     leaders.sort_unstable();
     leaders.dedup();

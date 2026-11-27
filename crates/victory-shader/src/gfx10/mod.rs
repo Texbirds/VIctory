@@ -20,7 +20,7 @@ mod sp3;
 
 pub use fields::{Cache, Dpp, Fields, NULL, Operand, Sdwa, Valu};
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use crate::ShaderError;
 
@@ -71,38 +71,99 @@ impl Instruction {
 
 /// Decodes every instruction reachable from offset 0, sorted by offset.
 pub fn decode(code: &[u8]) -> Result<Vec<Instruction>, ShaderError> {
+    Ok(decode_with_flows(code)?.0)
+}
+
+/// The same walk with its final control-flow decisions. IR must use these
+/// rather than resolve a far jump again from a different set of predecessors.
+pub(crate) fn decode_with_flows(code: &[u8]) -> Result<(Vec<Instruction>, Vec<Flow>), ShaderError> {
     if !code.len().is_multiple_of(4) {
         return Err(isa(code.len(), "code size is not a multiple of 4"));
     }
-    let mut found = BTreeMap::new();
-    let mut pending = vec![0usize];
-    while let Some(mut offset) = pending.pop() {
-        while !found.contains_key(&offset) {
-            let inst = instruction(code, offset)?;
-            let next = offset + 4 * inst.words.len();
-            let flow = control(&inst, code.len(), |at| {
-                found.range(..at).next_back().map(|(_, i)| i)
-            })?;
-            found.insert(offset, inst);
-            match flow {
-                Flow::Next => offset = next,
-                Flow::Stop => break,
-                Flow::Jump(target) => offset = target,
-                Flow::Branch(target) => {
-                    pending.push(target);
-                    offset = next;
+
+    // A later path can enter a chain already followed as a far jump. Keep
+    // discovered entries across retries: making a jump indirect can remove
+    // the very path that revealed the entry, but cannot make its setup safe.
+    let mut entries = BTreeSet::new();
+    loop {
+        let mut found: BTreeMap<usize, (Instruction, Flow)> = BTreeMap::new();
+        let mut errors = BTreeMap::new();
+        let mut chains = Vec::new();
+        let mut pending = vec![0usize];
+        while let Some(mut offset) = pending.pop() {
+            while !found.contains_key(&offset) && !errors.contains_key(&offset) {
+                let inst = match instruction(code, offset) {
+                    Ok(inst) => inst,
+                    Err(error) => {
+                        errors.insert(offset, error);
+                        break;
+                    }
+                };
+                let next = offset + 4 * inst.words.len();
+                let evaluated = flow(&inst, next, code.len()).and_then(|flow| {
+                    if flow != Flow::Stop || inst.name() != Some("s_setpc_b64") {
+                        return Ok(flow);
+                    }
+                    let jump = far_jump(
+                        |at| found.range(..at).next_back().map(|(_, (i, _))| i),
+                        &inst,
+                        code.len(),
+                        &entries,
+                    );
+                    match jump {
+                        Some(jump) => {
+                            chains.push((jump.start, offset));
+                            jump.target.map(Flow::Jump)
+                        }
+                        None => Ok(Flow::Stop),
+                    }
+                });
+                let flow = match evaluated {
+                    Ok(flow) => flow,
+                    Err(error) => {
+                        errors.insert(offset, error);
+                        Flow::Stop
+                    }
+                };
+                found.insert(offset, (inst, flow));
+                match flow {
+                    Flow::Next => offset = next,
+                    Flow::Stop => break,
+                    Flow::Jump(target) => {
+                        entries.insert(target);
+                        offset = target;
+                    }
+                    Flow::Branch(target) => {
+                        entries.insert(target);
+                        pending.push(target);
+                        offset = next;
+                    }
                 }
             }
         }
+
+        if chains
+            .iter()
+            .any(|&(start, end)| entries.range(start + 1..=end).next().is_some())
+        {
+            // Every retry has at least one newly discovered entry that
+            // blocks a previously accepted chain, so this converges.
+            continue;
+        }
+        // An error on a speculative target must not hide another path
+        // which invalidates that jump. Report errors only after the retry.
+        if let Some(error) = errors.into_values().next() {
+            return Err(error);
+        }
+        let (list, flows): (Vec<Instruction>, Vec<Flow>) = found.into_values().unzip();
+        if let Some(w) = list
+            .windows(2)
+            .find(|w| w[0].offset + 4 * w[0].words.len() > w[1].offset)
+        {
+            return Err(isa(w[1].offset, "a branch lands inside an instruction"));
+        }
+        return Ok((list, flows));
     }
-    let list: Vec<Instruction> = found.into_values().collect();
-    if let Some(w) = list
-        .windows(2)
-        .find(|w| w[0].offset + 4 * w[0].words.len() > w[1].offset)
-    {
-        return Err(isa(w[1].offset, "a branch lands inside an instruction"));
-    }
-    Ok(list)
 }
 
 /// Where execution goes after an instruction.
@@ -114,21 +175,6 @@ pub(crate) enum Flow {
     Jump(usize),
     /// Conditional: to the target or the next instruction.
     Branch(usize),
-}
-
-/// Control flow after `inst`, resolving far jumps. `before(at)` returns the
-/// decoded instruction with the highest offset below `at`, if any.
-pub(crate) fn control<'a>(
-    inst: &Instruction,
-    len: usize,
-    before: impl Fn(usize) -> Option<&'a Instruction>,
-) -> Result<Flow, ShaderError> {
-    Ok(match flow(inst, inst.offset + 4 * inst.words.len(), len)? {
-        Flow::Stop if inst.name() == Some("s_setpc_b64") => {
-            far_jump(before, inst, len)?.map_or(Flow::Stop, Flow::Jump)
-        }
-        flow => flow,
-    })
 }
 
 fn flow(inst: &Instruction, next: usize, len: usize) -> Result<Flow, ShaderError> {
@@ -153,17 +199,26 @@ fn flow(inst: &Instruction, next: usize, len: usize) -> Result<Flow, ShaderError
     })
 }
 
+struct FarJump {
+    start: usize,
+    target: Result<usize, ShaderError>,
+}
+
 /// Resolves the far jump compilers emit beyond the reach of a branch offset:
 /// `s_getpc_b64 s[n:n+1]`, `s_add_u32|s_sub_u32 sn, sn, literal`, a carry
 /// into s(n+1), `s_setpc_b64 s[n:n+1]`, looking back over the straight-line
-/// run just decoded. Any other `s_setpc_b64` (e.g. a handover to the next
-/// merged stage through registers) gives `None`.
+/// run just decoded. Only NOPs and waits may separate those operations:
+/// another instruction may overwrite the pair or its carry. Any other
+/// `s_setpc_b64` (e.g. a handover to the next merged stage) gives `None`.
+/// A branch may enter at getpc, but must not bypass any of the setup.
 fn far_jump<'a>(
     before: impl Fn(usize) -> Option<&'a Instruction>,
     setpc: &Instruction,
     len: usize,
-) -> Result<Option<usize>, ShaderError> {
+    entries: &BTreeSet<usize>,
+) -> Option<FarJump> {
     let n = setpc.words[0] & 0xFF;
+    let mut carry = None;
     let mut delta = None;
     let mut at = setpc.offset;
     for _ in 0..4 {
@@ -176,28 +231,59 @@ fn far_jump<'a>(
         let w = prev.words[0];
         let (sdst, ssrc0, ssrc1) = ((w >> 16) & 0x7F, w & 0xFF, (w >> 8) & 0xFF);
         match (prev.encoding, prev.name()) {
+            (Encoding::Sop2, Some(op @ ("s_addc_u32" | "s_subb_u32")))
+                if sdst == n + 1 && ssrc0 == n + 1 && carry.is_none() && delta.is_none() =>
+            {
+                let high = match ssrc1 {
+                    128..=192 => ssrc1 - 128,
+                    193..=208 => (192i32 - ssrc1 as i32) as u32,
+                    0xFF => prev.words[1],
+                    _ => return None,
+                };
+                carry = Some((op, high));
+            }
             (Encoding::Sop2, Some(op @ ("s_add_u32" | "s_sub_u32")))
                 if sdst == n && ssrc0 == n && ssrc1 == 0xFF && delta.is_none() =>
             {
-                // The low dword of a signed 64-bit offset: a backward jump
-                // adds a negative one (its high dword is -1).
-                let literal = i64::from(prev.words[1] as i32);
+                let (high_op, high) = carry?;
+                if !matches!(
+                    (op, high_op),
+                    ("s_add_u32", "s_addc_u32") | ("s_sub_u32", "s_subb_u32")
+                ) {
+                    return None;
+                }
+                // Both words form the signed offset. In particular, a low
+                // word with bit 31 set is not negative when the high is 0.
+                // i128 also permits negating i64::MIN for subtraction.
+                let literal =
+                    i128::from(((u64::from(high) << 32) | u64::from(prev.words[1])) as i64);
                 delta = Some(if op == "s_add_u32" { literal } else { -literal });
             }
             (Encoding::Sop1, Some("s_getpc_b64")) if sdst == n => {
                 let Some(delta) = delta else { break };
+                if entries
+                    .range(prev.offset + 1..=setpc.offset)
+                    .next()
+                    .is_some()
+                {
+                    return None;
+                }
                 // s_getpc_b64 yields the address of the instruction after it.
-                return usize::try_from(prev.offset as i64 + 4 + delta)
+                let target = usize::try_from(prev.offset as i128 + 4 + delta)
                     .ok()
                     .filter(|&t| t < len)
-                    .map(Some)
                     .ok_or(isa(setpc.offset, "far jump target outside the code"));
+                return Some(FarJump {
+                    start: prev.offset,
+                    target,
+                });
             }
-            _ => {}
+            (Encoding::Sopp, Some("s_nop" | "s_waitcnt" | "s_waitcnt_depctr")) => {}
+            _ => return None,
         }
         at = prev.offset;
     }
-    Ok(None)
+    None
 }
 
 fn instruction(code: &[u8], offset: usize) -> Result<Instruction, ShaderError> {
@@ -493,6 +579,325 @@ mod tests {
                 (20, "s_addc_u32"),
                 (24, "s_setpc_b64"),
             ]
+        );
+    }
+
+    #[test]
+    fn far_jumps_require_the_matching_high_word_operation() {
+        for high in [
+            0xBF80_0000, // s_nop: no high-word operation
+            0xBE88_0380, // s_mov_b32 s8, 0: overwrites the low word
+            0xBE89_0380, // s_mov_b32 s9, 0: overwrites the high word
+            0x8289_8009, // s_subb_u32 s9, s9, 0: wrong arithmetic
+            0x820A_8009, // s_addc_u32 s10, s9, 0: wrong destination
+            0x8209_8007, // s_addc_u32 s9, s7, 0: wrong source
+            0x8209_0A09, // s_addc_u32 s9, s9, s10: unknown high immediate
+        ] {
+            let code = [
+                0xBE88_1F00, // s_getpc_b64 s[8:9]
+                0x8008_FF08,
+                20, // s_add_u32 s8, s8, 20
+                high,
+                0xBE80_2008, // s_setpc_b64 s[8:9]
+                0xFFFF_FFFF, // data, not reached by a recognized far jump
+                S_ENDPGM,
+            ];
+            let found = summary(&code);
+            assert_eq!(found.last().unwrap().0, 16, "high word {high:#x}");
+            assert_eq!(found.last().unwrap().2, "s_setpc_b64");
+            let ir = crate::ir::build(&bytes(&code), false, 1).unwrap();
+            assert_eq!(ir.blocks[0].exit, crate::ir::Exit::Indirect);
+        }
+    }
+
+    #[test]
+    fn far_jumps_do_not_skip_register_or_carry_clobbers() {
+        for (at, clobber) in [
+            (1, 0xBE89_0380), // overwrite the high word before the add
+            (3, 0x800A_800A), // s_add_u32 s10, s10, 0 overwrites SCC
+            (4, 0xBE88_0380), // overwrite the low word after the carry
+            (4, 0xBE89_0380), // overwrite the high word after the carry
+        ] {
+            let mut code = vec![
+                0xBE88_1F00, // s_getpc_b64 s[8:9]
+                0x8008_FF08,
+                24,          // s_add_u32 s8, s8, 24 -> stale target 28
+                0x8209_8009, // s_addc_u32 s9, s9, 0
+                0xBE80_2008, // s_setpc_b64 s[8:9]
+                0xFFFF_FFFF,
+                S_ENDPGM,
+            ];
+            code.insert(at, clobber);
+            let found = summary(&code);
+            assert_eq!(found.last().unwrap().0, 20, "clobber {clobber:#x} at {at}");
+            assert_eq!(found.last().unwrap().2, "s_setpc_b64");
+            let ir = crate::ir::build(&bytes(&code), false, 1).unwrap();
+            assert_eq!(ir.blocks[0].exit, crate::ir::Exit::Indirect);
+        }
+    }
+
+    #[test]
+    fn far_jumps_use_both_halves_of_the_offset() {
+        for high in [0x8209_8109, 0x8209_C109] {
+            // A high word of 1 or -1 makes this a roughly +/-4 GiB offset,
+            // not the in-range +20 suggested by the low word alone.
+            let code = [
+                0xBE88_1F00,
+                0x8008_FF08,
+                20,
+                high,
+                0xBE80_2008,
+                0xFFFF_FFFF,
+                S_ENDPGM,
+            ];
+            assert!(matches!(
+                decode(&bytes(&code)),
+                Err(ShaderError::Isa {
+                    reason: "far jump target outside the code",
+                    ..
+                })
+            ));
+        }
+        // A low word with its sign bit set is positive when its high word
+        // is zero. It must not be mistaken for the -8 backward-jump form.
+        let code = [
+            sopp(0x02, 1),
+            S_ENDPGM,
+            0xBE88_1F00,
+            0x8008_FF08,
+            0xFFFF_FFF8,
+            0x8209_8009,
+            0xBE80_2008,
+        ];
+        assert!(matches!(
+            decode(&bytes(&code)),
+            Err(ShaderError::Isa {
+                reason: "far jump target outside the code",
+                ..
+            })
+        ));
+        // Subtracting the most negative signed 64-bit offset cannot fit
+        // this program either, but must not overflow the host arithmetic.
+        let code = [
+            0xBE88_1F00,
+            0x8088_FF08,
+            0,
+            0x8289_FF09,
+            0x8000_0000,
+            0xBE80_2008,
+        ];
+        assert!(matches!(
+            decode(&bytes(&code)),
+            Err(ShaderError::Isa {
+                reason: "far jump target outside the code",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn far_jump_arithmetic_keeps_forward_and_backward_add_and_subtract() {
+        for (low_op, low, high, target) in [
+            (0x8008_FF08, 20, 0x8209_8009, 32),          // add +20
+            (0x8008_FF08, 0xFFFF_FFF8, 0x8209_C109, 4),  // add -8
+            (0x8088_FF08, 0xFFFF_FFEC, 0x8289_C109, 32), // subtract -20
+            (0x8088_FF08, 8, 0x8289_8009, 4),            // subtract +8
+        ] {
+            let code = [
+                sopp(0x02, 1),
+                S_ENDPGM,
+                0xBE88_1F00,
+                low_op,
+                low,
+                high,
+                0xBE80_2008,
+                0xFFFF_FFFF,
+                S_ENDPGM,
+            ];
+            let ends: Vec<_> = summary(&code)
+                .into_iter()
+                .filter(|i| i.2 == "s_endpgm")
+                .map(|i| i.0)
+                .collect();
+            assert_eq!(ends, [target], "low {low:#x}, high {high:#x}");
+        }
+    }
+
+    #[test]
+    fn far_jumps_allow_literal_high_words_and_scheduling() {
+        let forward = [
+            0xBE88_1F00,
+            0x8008_FF08,
+            24,
+            0x8209_FF09,
+            0,
+            0xBE80_2008,
+            0xFFFF_FFFF,
+            S_ENDPGM,
+        ];
+        assert_eq!(summary(&forward).last().unwrap().0, 28);
+        let backward = [
+            sopp(0x02, 1),
+            S_ENDPGM,
+            0xBE88_1F00,
+            0x8008_FF08,
+            0xFFFF_FFF8,
+            0x8209_FF09,
+            0xFFFF_FFFF,
+            0xBE80_2008,
+        ];
+        assert!(summary(&backward).contains(&(4, 1, "s_endpgm")));
+
+        for wait in [0xBF80_0000, 0xBF8C_0000, 0xBFA3_FFFF] {
+            for at in [1, 3, 4] {
+                let mut code = vec![
+                    0xBE88_1F00,
+                    0x8008_FF08,
+                    24,
+                    0x8209_8009,
+                    0xBE80_2008,
+                    0xFFFF_FFFF,
+                    S_ENDPGM,
+                ];
+                code.insert(at, wait);
+                assert_eq!(
+                    summary(&code).last().unwrap().0,
+                    28,
+                    "wait {wait:#x} at {at}"
+                );
+            }
+        }
+    }
+
+    fn assert_indirect(code: &[u32], setpc: usize, absent: usize) {
+        let code = bytes(code);
+        let decoded = decode(&code).unwrap();
+        assert!(decoded.iter().any(|i| i.offset == setpc));
+        assert!(decoded.iter().all(|i| i.offset != absent));
+        for wave64 in [false, true] {
+            let ir = crate::ir::build(&code, wave64, 1).unwrap();
+            let block = ir
+                .blocks
+                .iter()
+                .find(|b| b.insts.last().is_some_and(|i| i.machine.offset == setpc))
+                .unwrap();
+            assert_eq!(block.exit, crate::ir::Exit::Indirect);
+        }
+    }
+
+    #[test]
+    fn far_jump_setup_cannot_be_entered_after_getpc() {
+        for target in [8, 16, 20] {
+            let code = [
+                sopp(0x05, (target - 4) / 4), // conditional entry to low, high, or setpc
+                0xBE88_1F00,                  // getpc at 4, next PC 8
+                0x8008_FF08,
+                24, // low offset: candidate target 32
+                0x8209_8009,
+                0xBE80_2008,
+                0xFFFF_FFFF,
+                0xFFFF_FFFF,
+                S_ENDPGM,
+            ];
+            assert_indirect(&code, 20, 32);
+        }
+    }
+
+    #[test]
+    fn far_jump_control_is_independent_of_decode_order() {
+        let code = [
+            sopp(0x05, 1), // queue getpc at 8
+            sopp(0x02, 4), // visit setpc at 24 before its setup
+            0xBE88_1F00,
+            0x8008_FF08,
+            20, // next PC 12 + 20 = candidate target 32
+            0x8209_8009,
+            0xBE80_2008,
+            0xFFFF_FFFF,
+            S_ENDPGM,
+        ];
+        assert_indirect(&code, 24, 32);
+    }
+
+    #[test]
+    fn far_jump_setup_rechecks_entries_found_on_another_path() {
+        for (low, absent) in [(24, 32), (36, 44), (0x1000, 32)] {
+            let code = [
+                sopp(0x05, 8), // queue the branch at 36, then visit the setup
+                0xBE88_1F00,
+                0x8008_FF08,
+                low,
+                0x8209_8009,
+                0xBE80_2008,
+                0xFFFF_FFFF,
+                0xFFFF_FFFF,
+                0xFFFF_FFFF,    // candidate target 32 is data, not code
+                sopp(0x02, -5), // late entry to setpc at 20
+                0xFFFF_FFFF,
+                S_ENDPGM, // a valid speculative target at 44 must also be removed
+            ];
+            // Neither the invalid instruction at 32 nor an out-of-bounds
+            // candidate may fail decoding before the late entry is known.
+            assert_indirect(&code, 20, absent);
+        }
+    }
+
+    #[test]
+    fn far_jump_setup_rechecks_entries_from_far_jumps() {
+        let code = [
+            sopp(0x05, 8), // queue the other getpc at 36
+            0xBE88_1F00,
+            0x8008_FF08,
+            24, // candidate target 32
+            0x8209_8009,
+            0xBE80_2008,
+            0xFFFF_FFFF,
+            0xFFFF_FFFF,
+            0xFFFF_FFFF,
+            0xBE8A_1F00, // getpc s[10:11], next PC 40
+            0x808A_FF0A,
+            20, // subtract 20 -> entry to the first setpc at 20
+            0x828B_800B,
+            0xBE80_200A,
+        ];
+        assert_indirect(&code, 20, 32);
+    }
+
+    #[test]
+    fn far_jump_control_survives_removal_of_speculative_code() {
+        let code = [
+            0xBE88_1F00,
+            0x8008_FF08,
+            20,
+            0x8209_8009,
+            0xBE80_2008, // setpc at 16, candidate target 24
+            0xFFFF_FFFF,
+            sopp(0x02, -3), // the candidate itself enters setpc at 16
+        ];
+        // Once that entry invalidates the chain, the branch at 24 is no
+        // longer statically reachable. IR must retain the indirect exit.
+        assert_indirect(&code, 16, 24);
+    }
+
+    #[test]
+    fn far_jump_setup_allows_getpc_entries_and_ignores_data_branches() {
+        let code = [
+            sopp(0x05, 0), // entering getpc itself is safe
+            0xBE88_1F00,
+            0x8008_FF08,
+            20, // next PC 8 + 20 = target 28
+            0x8209_8009,
+            0xBE80_2008,
+            sopp(0x02, -2), // data at 24 looks like a branch to setpc
+            S_ENDPGM,
+        ];
+        assert_eq!(summary(&code).last().unwrap().0, 28);
+        let ir = crate::ir::build(&bytes(&code), false, 1).unwrap();
+        assert!(ir.blocks.iter().any(|b| b.offset == 28));
+        assert!(
+            !ir.blocks
+                .iter()
+                .any(|b| b.exit == crate::ir::Exit::Indirect)
         );
     }
 
